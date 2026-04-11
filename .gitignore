@@ -1,0 +1,59 @@
+# Java Maven 项目忽略项
+# 编译输出目录
+target/
+
+# IDE 生成文件
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# Maven 包装器
+.mvn/wrapper/maven-wrapper.jar
+
+# 日志文件
+*.log
+
+# 环境变量文件
+.env
+
+# 操作系统生成文件
+.DS_Store
+Thumbs.db
+
+# Python Conda 项目忽略项
+# 虚拟环境目录
+env/
+venv/
+.venv/
+
+# Python 编译文件
+__pycache__/
+*.pyc
+
+# Conda 相关文件
+conda.lock
+environment.yml
+
+# Jupyter Notebook 相关
+.ipynb_checkpoints/
+
+# 数据文件（可选，根据项目需求）
+data/
+
+# 依赖文件（可选，根据项目需求）
+requirements.txt
+
+# 测试覆盖率文件
+coverage.xml
+.coverage
+
+# 临时文件
+*.tmp
+*.temp
+
+# 构建文件
+build/
+dist/
+*.egg-info/
