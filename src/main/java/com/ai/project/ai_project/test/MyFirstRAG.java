@@ -8,16 +8,7 @@ import java.util.concurrent.CountDownLatch;
 
 public class MyFirstRAG {
     public static void main(String[] args) throws InterruptedException {
-        String apiKey = System.getenv("OPENAI_API_KEY");
-        if (apiKey == null || apiKey.isBlank()) {
-            throw new IllegalStateException("请先设置环境变量 OPENAI_API_KEY");
-        }
-
-        OpenAiStreamingChatModel model = OpenAiStreamingChatModel.builder()
-                .baseUrl("https://api-vip.codex-for.me/v1")
-                .apiKey(apiKey)
-                .modelName("gpt-5.2")
-                .build();
+        OpenAiStreamingChatModel model = MyFirstRagConfig.openAiStreamingChatModel();
 
         CountDownLatch latch = new CountDownLatch(1);
         model.chat("测试API连通性", new StreamingChatResponseHandler() {

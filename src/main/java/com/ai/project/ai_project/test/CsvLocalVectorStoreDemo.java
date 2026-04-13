@@ -35,7 +35,7 @@ public class CsvLocalVectorStoreDemo {
         }
         System.out.println("已写入向量条数: " + segments.size());
 
-        String query = "查找张三";
+        String query = "谁是上海专家";
         Embedding queryEmbedding = embeddingModel.embed(query).content();
 
         EmbeddingSearchRequest searchRequest = EmbeddingSearchRequest.builder()
