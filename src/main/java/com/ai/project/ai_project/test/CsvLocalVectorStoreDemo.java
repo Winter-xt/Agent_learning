@@ -4,9 +4,11 @@ import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
-import dev.langchain4j.store.embedding.EmbeddingMatch;
-import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
-import dev.langchain4j.store.embedding.EmbeddingSearchResult;
+import dev.langchain4j.model.ollama.OllamaChatModel;
+import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
+import dev.langchain4j.service.AiServices;
+import dev.langchain4j.service.SystemMessage;
+import dev.langchain4j.service.UserMessage;
 import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
 
 import java.io.IOException;
@@ -18,6 +20,17 @@ import java.util.List;
 public class CsvLocalVectorStoreDemo {
 
     private static final Path CSV_PATH = Path.of("/Users/winter/Downloads/test_users.csv");
+    private static final String OLLAMA_BASE_URL = "http://localhost:11434";
+    private static final String OLLAMA_MODEL_NAME = "deepseek-r1:8b";
+
+    interface TalentAnalyst {
+        @SystemMessage("""
+                你是一个专业的招聘专家。
+                我会为你提供一些候选人的 CSV 数据。
+                请根据数据准确回答问题，如果数据中没有提到，请直说不知道。
+                """)
+        String analyze(@UserMessage String userQuery);
+    }
 
     public static void main(String[] args) throws IOException {
         EmbeddingModel embeddingModel = new AllMiniLmL6V2QuantizedEmbeddingModel();
@@ -35,21 +48,20 @@ public class CsvLocalVectorStoreDemo {
         }
         System.out.println("已写入向量条数: " + segments.size());
 
-        String query = "谁是上海专家";
-        Embedding queryEmbedding = embeddingModel.embed(query).content();
-
-        EmbeddingSearchRequest searchRequest = EmbeddingSearchRequest.builder()
-                .queryEmbedding(queryEmbedding)
+        EmbeddingStoreContentRetriever retriever = EmbeddingStoreContentRetriever.builder()
+                .embeddingStore(embeddingStore)
+                .embeddingModel(embeddingModel)
                 .maxResults(3)
                 .build();
 
-        EmbeddingSearchResult<TextSegment> result = embeddingStore.search(searchRequest);
+        TalentAnalyst analyst = AiServices.builder(TalentAnalyst.class)
+                .chatLanguageModel(MyFirstRagConfig.ollamaChatModel())
+                .contentRetriever(retriever)
+                .build();
 
-        System.out.println("检索关键词: " + query);
-        System.out.println("Top " + result.matches().size() + " 结果:");
-        for (EmbeddingMatch<TextSegment> match : result.matches()) {
-            System.out.printf("- score=%.4f, text=%s%n", match.score(), match.embedded().text());
-        }
+        String question = args.length > 0 ? args[0] : "帮我看看，这些人里谁最懂 Java？他在哪儿工作？";
+        String result = analyst.analyze(question);
+        System.out.println("AI 的分析报告：\n" + result);
     }
 
     private static List<TextSegment> loadCsvAsSegments(Path csvPath) throws IOException {
@@ -67,5 +79,10 @@ public class CsvLocalVectorStoreDemo {
             }
         }
         return segments;
+    }
+
+    private static String readEnvOrDefault(String key, String defaultValue) {
+        String value = System.getenv(key);
+        return (value == null || value.isBlank()) ? defaultValue : value;
     }
 }
