@@ -4,10 +4,10 @@ import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
-import dev.langchain4j.model.ollama.OllamaChatModel;
 import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
 import dev.langchain4j.service.AiServices;
 import dev.langchain4j.service.SystemMessage;
+import dev.langchain4j.service.TokenStream;
 import dev.langchain4j.service.UserMessage;
 import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
 
@@ -16,12 +16,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 
 public class CsvLocalVectorStoreDemo {
 
     private static final Path CSV_PATH = Path.of("/Users/winter/Downloads/test_users.csv");
-    private static final String OLLAMA_BASE_URL = "http://localhost:11434";
-    private static final String OLLAMA_MODEL_NAME = "deepseek-r1:8b";
 
     interface TalentAnalyst {
         @SystemMessage("""
@@ -29,10 +28,10 @@ public class CsvLocalVectorStoreDemo {
                 我会为你提供一些候选人的 CSV 数据。
                 请根据数据准确回答问题，如果数据中没有提到，请直说不知道。
                 """)
-        String analyze(@UserMessage String userQuery);
+        TokenStream analyze(@UserMessage String userQuery);
     }
 
-    public static void main(String[] args) throws IOException {
+    public static void main(String[] args) throws IOException, InterruptedException {
         EmbeddingModel embeddingModel = new AllMiniLmL6V2QuantizedEmbeddingModel();
         InMemoryEmbeddingStore<TextSegment> embeddingStore = new InMemoryEmbeddingStore<>();
 
@@ -55,13 +54,25 @@ public class CsvLocalVectorStoreDemo {
                 .build();
 
         TalentAnalyst analyst = AiServices.builder(TalentAnalyst.class)
-                .chatLanguageModel(MyFirstRagConfig.ollamaChatModel())
+                .streamingChatLanguageModel(MyFirstRagConfig.openAiStreamingChatModel())
                 .contentRetriever(retriever)
                 .build();
 
         String question = args.length > 0 ? args[0] : "帮我看看，这些人里谁最懂 Java？他在哪儿工作？";
-        String result = analyst.analyze(question);
-        System.out.println("AI 的分析报告：\n" + result);
+        System.out.println("AI 的分析报告：");
+        CountDownLatch latch = new CountDownLatch(1);
+        analyst.analyze(question)
+                .onPartialResponse(System.out::print)
+                .onCompleteResponse(resp -> {
+                    System.out.println();
+                    latch.countDown();
+                })
+                .onError(err -> {
+                    err.printStackTrace();
+                    latch.countDown();
+                })
+                .start();
+        latch.await();
     }
 
     private static List<TextSegment> loadCsvAsSegments(Path csvPath) throws IOException {
@@ -79,10 +90,5 @@ public class CsvLocalVectorStoreDemo {
             }
         }
         return segments;
-    }
-
-    private static String readEnvOrDefault(String key, String defaultValue) {
-        String value = System.getenv(key);
-        return (value == null || value.isBlank()) ? defaultValue : value;
     }
 }
