@@ -1,5 +1,7 @@
-package com.ai.project.ai_project.test;
+package com.ai.project.ai_project.test.rag;
 
+import com.ai.project.ai_project.test.model.MyFirstRagConfig;
+import com.ai.project.ai_project.test.tools.FinancialTools;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
@@ -28,7 +30,7 @@ public class CsvLocalVectorStoreDemo {
                 我会为你提供一些候选人的 CSV 数据。
                 请根据数据准确回答问题，如果数据中没有提到，请直说不知道。
                 """)
-        TokenStream analyze(@UserMessage String userQuery);
+        String analyze(@UserMessage String userQuery);
     }
 
     public static void main(String[] args) throws IOException, InterruptedException {
@@ -54,25 +56,29 @@ public class CsvLocalVectorStoreDemo {
                 .build();
 
         TalentAnalyst analyst = AiServices.builder(TalentAnalyst.class)
-                .streamingChatLanguageModel(MyFirstRagConfig.openAiStreamingChatModel())
+                .chatLanguageModel(MyFirstRagConfig.ollamaChatModel())
                 .contentRetriever(retriever)
+                .tools(new FinancialTools())
                 .build();
 
-        String question = args.length > 0 ? args[0] : "帮我看看，这些人里谁最懂 Java？他在哪儿工作？";
+        String question = args.length > 0 ? args[0] : "我是张三,帮我看看我有多少余额";
         System.out.println("AI 的分析报告：");
-        CountDownLatch latch = new CountDownLatch(1);
-        analyst.analyze(question)
-                .onPartialResponse(System.out::print)
-                .onCompleteResponse(resp -> {
-                    System.out.println();
-                    latch.countDown();
-                })
-                .onError(err -> {
-                    err.printStackTrace();
-                    latch.countDown();
-                })
-                .start();
-        latch.await();
+        //流式输出
+//        CountDownLatch latch = new CountDownLatch(1);
+//        analyst.analyze(question)
+//                .onPartialResponse(System.out::print)
+//                .onCompleteResponse(resp -> {
+//                    System.out.println();
+//                    latch.countDown();
+//                })
+//                .onError(err -> {
+//                    err.printStackTrace();
+//                    latch.countDown();
+//                })
+//                .start();
+//        latch.await();
+        String analyze = analyst.analyze(question);
+        System.out.println(analyze);
     }
 
     private static List<TextSegment> loadCsvAsSegments(Path csvPath) throws IOException {

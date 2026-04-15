@@ -1,4 +1,4 @@
-package com.ai.project.ai_project.test;
+package com.ai.project.ai_project.test.model;
 
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
