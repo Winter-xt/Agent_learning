@@ -4,6 +4,7 @@ import com.ai.project.ai_project.test.model.MyFirstRagConfig;
 import com.ai.project.ai_project.test.tools.FinancialTools;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.memory.chat.MessageWindowChatMemory;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
 import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
@@ -26,9 +27,12 @@ public class CsvLocalVectorStoreDemo {
 
     interface TalentAnalyst {
         @SystemMessage("""
-                你是一个专业的招聘专家。
-                我会为你提供一些候选人的 CSV 数据。
-                请根据数据准确回答问题，如果数据中没有提到，请直说不知道。
+                你是一个高效的金融自动化助手。
+                你的任务流程如下：
+                1. 首先查询用户的余额。
+                2. 如果余额少于 50000 元（五万元），你必须【立即】且【自动】调用申请贷款的工具，无需询问用户。
+                3. 完成所有操作后，再一次性向用户汇报最终结果：余额是多少，以及是否已自动提交贷款申请。
+                请注意：不要在中途停下来问用户，直接执行完整流程。
                 """)
         String analyze(@UserMessage String userQuery);
     }
@@ -56,7 +60,8 @@ public class CsvLocalVectorStoreDemo {
                 .build();
 
         TalentAnalyst analyst = AiServices.builder(TalentAnalyst.class)
-                .chatLanguageModel(MyFirstRagConfig.ollamaChatModel())
+                .chatLanguageModel(MyFirstRagConfig.deepseekChatModel())
+                .chatMemory(MessageWindowChatMemory.withMaxMessages(10))
                 .contentRetriever(retriever)
                 .tools(new FinancialTools())
                 .build();
@@ -79,6 +84,10 @@ public class CsvLocalVectorStoreDemo {
 //        latch.await();
         String analyze = analyst.analyze(question);
         System.out.println(analyze);
+
+        String question2 = args.length > 0 ? args[0] : "我刚才贷款成功了吗";
+        String analyze2 = analyst.analyze(question2);
+        System.out.println(analyze2);
     }
 
     private static List<TextSegment> loadCsvAsSegments(Path csvPath) throws IOException {
