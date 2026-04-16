@@ -16,23 +16,31 @@ public final class MyFirstRagConfig {
     private MyFirstRagConfig() {
     }
 
-    public static OpenAiStreamingChatModel openAiStreamingChatModel() {
+    public static OpenAiStreamingChatModel openAiStreamingChatModel(String apiKey) {
         return OpenAiStreamingChatModel.builder()
-                .apiKey(requireOpenAiApiKey())
+                .apiKey(apiKey)
                 .modelName(MODEL_NAME)
                 .build();
     }
-    public static GoogleAiGeminiChatModel googleAiGeminiChatModel() {
+
+    public static OpenAiStreamingChatModel deepseekStreamingChatModel(String apiKey) {
+        return OpenAiStreamingChatModel.builder()
+                .apiKey(apiKey)
+                .baseUrl("https://api.deepseek.com")
+                .modelName(DEEPSEEK_API_MODEL_NAME)
+                .build();
+    }
+
+    public static GoogleAiGeminiChatModel googleAiGeminiChatModel(String apiKey) {
         return GoogleAiGeminiChatModel.builder()
-                .apiKey(System.getenv("GEMINI_AI_KEY"))
+                .apiKey(apiKey)
                 .modelName("gemini-2.5-flash")
                 .build();
     }
 
-
-    public static OpenAiChatModel deepseekChatModel() {
+    public static OpenAiChatModel deepseekChatModel(String apiKey) {
         return OpenAiChatModel.builder()
-                .apiKey(requireDeepseekApiKey())
+                .apiKey(apiKey)
                 .baseUrl("https://api.deepseek.com")
                 .modelName(DEEPSEEK_API_MODEL_NAME)
                 .build();
@@ -51,21 +59,5 @@ public final class MyFirstRagConfig {
     private static String readEnvOrDefault(String key, String defaultValue) {
         String value = System.getenv(key);
         return (value == null || value.isBlank()) ? defaultValue : value;
-    }
-
-    private static String requireOpenAiApiKey() {
-        String apiKey = System.getenv("OPENAI_API_KEY");
-        if (apiKey == null || apiKey.isBlank()) {
-            throw new IllegalStateException("请先设置环境变量 OPENAI_API_KEY");
-        }
-        return apiKey;
-    }
-
-    private static String requireDeepseekApiKey() {
-        String apiKey = System.getenv("DEEPSEEK_API_KEY");
-        if (apiKey == null || apiKey.isBlank()) {
-            throw new IllegalStateException("请先设置环境变量 DEEPSEEK_API_KEY");
-        }
-        return apiKey;
     }
 }

@@ -8,11 +8,13 @@ import dev.langchain4j.data.message.ChatMessageDeserializer;
 import dev.langchain4j.data.message.ChatMessageSerializer;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.chat.StreamingChatLanguageModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
 import dev.langchain4j.store.memory.chat.ChatMemoryStore;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -22,9 +24,23 @@ import java.util.List;
 @Configuration
 public class LangChainConfig {
 
+    @Value("${DEEPSEEK_API_KEY}")
+    private String deepseekApiKey;
+
+    @Value("${GEMINI_AI_KEY}")
+    private String geminiApiKey;
+
+    @Value("${OPENAI_API_KEY}")
+    private String openAiApiKey;
+
     @Bean
     public ChatLanguageModel chatLanguageModel() {
-        return MyFirstRagConfig.deepseekChatModel();
+        return MyFirstRagConfig.deepseekChatModel(deepseekApiKey);
+    }
+
+    @Bean
+    public StreamingChatLanguageModel streamingChatLanguageModel() {
+        return MyFirstRagConfig.deepseekStreamingChatModel(deepseekApiKey);
     }
 
     @Bean
