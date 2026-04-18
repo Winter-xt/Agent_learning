@@ -5,7 +5,7 @@ import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
 import dev.langchain4j.model.ollama.OllamaChatModel;
 
-public final class MyFirstRagConfig {
+public final class ModelConfig {
 
     private static final String BASE_URL = "https://api-vip.codex-for.me/v1";
     private static final String MODEL_NAME = "gpt-5.2";
@@ -13,7 +13,7 @@ public final class MyFirstRagConfig {
     private static final String OLLAMA_QWEN_MODEL_NAME = "qwen3.5:9b";
     private static final String DEEPSEEK_API_MODEL_NAME = "deepseek-chat";
 
-    private MyFirstRagConfig() {
+    private ModelConfig() {
     }
 
     public static OpenAiStreamingChatModel openAiStreamingChatModel(String apiKey) {
