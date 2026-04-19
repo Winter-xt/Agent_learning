@@ -25,6 +25,8 @@ import java.util.List;
 
 @Service
 public class TalentService {
+    private static final String MEMORY_CATEGORY = "talent";
+    private static final String MEMORY_SCOPE_SEPARATOR = "::";
 
     private final ChatLanguageModel chatLanguageModel;
     private final StreamingChatLanguageModel streamingChatLanguageModel;
@@ -94,11 +96,16 @@ public class TalentService {
     }
 
     public String analyze(String userId, String query) {
-        return analyst.analyze(userId, query);
+        return analyst.analyze(scopedMemoryId(userId), query);
     }
 
     public TokenStream analyzeStream(String userId, String query) {
-        return streamingAnalyst.analyze(userId, query);
+        return streamingAnalyst.analyze(scopedMemoryId(userId), query);
+    }
+
+    private String scopedMemoryId(String userId) {
+        String safeUserId = (userId == null || userId.isBlank()) ? "default-user" : userId;
+        return MEMORY_CATEGORY + MEMORY_SCOPE_SEPARATOR + safeUserId;
     }
 
     public interface TalentAnalyst {

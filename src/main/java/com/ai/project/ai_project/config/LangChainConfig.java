@@ -23,6 +23,8 @@ import java.util.List;
 
 @Configuration
 public class LangChainConfig {
+    private static final String MEMORY_CATEGORY_SEPARATOR = "::";
+    private static final String DEFAULT_MEMORY_CATEGORY = "default";
 
     @Value("${DEEPSEEK_API_KEY}")
     private String deepseekApiKey;
@@ -38,6 +40,12 @@ public class LangChainConfig {
 
     @Value("${spring.data.redis.port:6379}")
     private int redisPort;
+
+    @Value("${app.vector.index-name:talent-index-v2}")
+    private String vectorIndexName;
+
+    @Value("${app.vector.prefix:talent:v2:}")
+    private String vectorPrefix;
 
     @Bean
     public ChatLanguageModel chatLanguageModel() {
@@ -60,8 +68,16 @@ public class LangChainConfig {
                 .host(redisHost)
                 .port(redisPort)
                 .dimension(384)
-                .indexName("talent-index")
-                .prefix("talent:")
+                .indexName(vectorIndexName)
+                .prefix(vectorPrefix)
+                .metadataKeys(List.of(
+                        "userIdKey",
+                        "sourceType",
+                        "userId",
+                        "fileName",
+                        "contentType",
+                        "uploadedAt"
+                ))
                 .build();
     }
 
@@ -73,7 +89,8 @@ public class LangChainConfig {
 
             @Override
             public List<ChatMessage> getMessages(Object memoryId) {
-                String key = KEY_PREFIX + memoryId;
+                MemoryScope scope = parseMemoryScope(memoryId);
+                String key = KEY_PREFIX + scope.category + ":" + scope.id;
                 String json = redisTemplate.opsForValue().get(key);
                 if (json != null) {
                     return new ArrayList<>(ChatMessageDeserializer.messagesFromJson(json));
@@ -83,18 +100,39 @@ public class LangChainConfig {
 
             @Override
             public void updateMessages(Object memoryId, List<ChatMessage> messages) {
-                String id = String.valueOf(memoryId);
+                MemoryScope scope = parseMemoryScope(memoryId);
                 String json = ChatMessageSerializer.messagesToJson(messages);
-                redisTemplate.opsForValue().set(KEY_PREFIX + id, json);
-                eventPublisher.publishEvent(new ChatMemoryPersistEvent(id, json, false));
+                redisTemplate.opsForValue().set(KEY_PREFIX + scope.category + ":" + scope.id, json);
+                eventPublisher.publishEvent(new ChatMemoryPersistEvent(scope.id, scope.category, json, false));
             }
 
             @Override
             public void deleteMessages(Object memoryId) {
-                String id = String.valueOf(memoryId);
-                redisTemplate.delete(KEY_PREFIX + id);
-                eventPublisher.publishEvent(new ChatMemoryPersistEvent(id, null, true));
+                MemoryScope scope = parseMemoryScope(memoryId);
+                redisTemplate.delete(KEY_PREFIX + scope.category + ":" + scope.id);
+                eventPublisher.publishEvent(new ChatMemoryPersistEvent(scope.id, scope.category, null, true));
             }
         };
+    }
+
+    private MemoryScope parseMemoryScope(Object memoryId) {
+        String raw = String.valueOf(memoryId);
+        if (raw.contains(MEMORY_CATEGORY_SEPARATOR)) {
+            String[] parts = raw.split(MEMORY_CATEGORY_SEPARATOR, 2);
+            String category = parts[0] == null || parts[0].isBlank() ? DEFAULT_MEMORY_CATEGORY : parts[0];
+            String id = parts.length < 2 || parts[1] == null || parts[1].isBlank() ? "default-user" : parts[1];
+            return new MemoryScope(id, category);
+        }
+        return new MemoryScope(raw, DEFAULT_MEMORY_CATEGORY);
+    }
+
+    private static class MemoryScope {
+        private final String id;
+        private final String category;
+
+        private MemoryScope(String id, String category) {
+            this.id = id;
+            this.category = category;
+        }
     }
 }

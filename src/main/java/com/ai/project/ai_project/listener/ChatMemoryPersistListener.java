@@ -20,15 +20,15 @@ public class ChatMemoryPersistListener {
     @EventListener
     public void onChatMemoryPersistEvent(ChatMemoryPersistEvent event) {
         if (event.isDelete()) {
-            mapper.deleteById(event.getMemoryId());
+            mapper.deleteByIdAndCategory(event.getMemoryId(), event.getCategory());
             return;
         }
 
-        ChatMemoryEntity entity = new ChatMemoryEntity(event.getMemoryId(), event.getMessagesJson());
-        if (mapper.selectById(entity.getId()) == null) {
+        ChatMemoryEntity entity = new ChatMemoryEntity(event.getMemoryId(), event.getCategory(), event.getMessagesJson());
+        if (mapper.selectByIdAndCategory(entity.getId(), entity.getCategory()) == null) {
             mapper.insert(entity);
         } else {
-            mapper.updateById(entity);
+            mapper.updateMessagesByIdAndCategory(entity.getId(), entity.getCategory(), entity.getMessages());
         }
     }
 }
