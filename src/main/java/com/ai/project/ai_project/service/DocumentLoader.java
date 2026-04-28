@@ -28,12 +28,12 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
 
@@ -259,7 +259,7 @@ public class DocumentLoader {
         EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
                 .queryEmbedding(embeddingModel.embed(query).content())
                 .maxResults(12)
-                .minScore(0.0)
+                .minScore(0.7)
                 .filter(filter)
                 .build();
 
@@ -369,8 +369,11 @@ public class DocumentLoader {
     private List<KeywordHit> searchKeywordHits(String normalizedUserId, String query, int limit) {
         try {
             String userIdKey = toHexKey(normalizedUserId);
-            String escapedQuery = escapeRedisTextQuery(query);
-            String redisQuery = "@userIdKey:{" + userIdKey + "} @sourceType:{resume} @parentBlock:(" + escapedQuery + ")";
+            String textClause = buildRedisTextClause(query);
+            if (textClause.isBlank()) {
+                return List.of();
+            }
+            String redisQuery = "@userIdKey:{" + userIdKey + "} @sourceType:{resume} @text:(" + textClause + ")";
             FTSearchParams params = FTSearchParams.searchParams()
                     .limit(0, limit)
                     .returnFields("parentType", "parentIndex", "parentBlock")
@@ -399,20 +402,50 @@ public class DocumentLoader {
         );
     }
 
-    private String escapeRedisTextQuery(String query) {
+    private String buildRedisTextClause(String query) {
         String normalized = safe(query);
         if (normalized.isBlank()) {
-            return "\"\"";
+            return "";
         }
-        List<String> tokens = Pattern.compile("[\\s,，。！？；;:：()（）]+")
+        List<String> tokens = Pattern.compile("[\\s,，。！？；;:：()（）\\-_/\\.]+")
                 .splitAsStream(normalized)
                 .filter(token -> !token.isBlank())
-                .map(token -> token.replaceAll("([\\\\@{}\\[\\]\\(\\)\\|\\-!~\"'])", "\\\\$1"))
                 .toList();
         if (tokens.isEmpty()) {
-            return "\"" + normalized + "\"";
+            return "";
         }
-        return tokens.stream().collect(Collectors.joining(" | "));
+
+        // Keep insertion order while avoiding duplicated clauses.
+        Set<String> clauses = new LinkedHashSet<>();
+        for (String rawToken : tokens) {
+            String token = rawToken.toLowerCase(Locale.ROOT).trim();
+            if (token.isBlank()) {
+                continue;
+            }
+            String escaped = token.replaceAll("([\\\\@{}\\[\\]\\(\\)\\|\\-!~\"'])", "\\\\$1");
+            clauses.add(escaped);
+            // Chinese terms benefit from prefix matching, e.g. "证书" -> "证书*"
+            if (containsHan(token) && token.length() >= 2) {
+                clauses.add(escaped + "*");
+            }
+        }
+        if (clauses.isEmpty()) {
+            return "";
+        }
+        return String.join(" | ", clauses);
+    }
+
+    private boolean containsHan(String text) {
+        if (text == null || text.isBlank()) {
+            return false;
+        }
+        for (int i = 0; i < text.length(); i++) {
+            Character.UnicodeScript script = Character.UnicodeScript.of(text.charAt(i));
+            if (script == Character.UnicodeScript.HAN) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private double reciprocalRank(int rankIndex) {

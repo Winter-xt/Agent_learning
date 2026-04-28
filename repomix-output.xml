@@ -115,72 +115,6 @@ public class AsyncConfig {
 }
 </file>
 
-<file path="src/main/java/com/ai/project/ai_project/config/ModelConfig.java">
-package com.ai.project.ai_project.config;
-
-import dev.langchain4j.model.googleai.GoogleAiGeminiChatModel;
-import dev.langchain4j.model.openai.OpenAiChatModel;
-import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
-import dev.langchain4j.model.ollama.OllamaChatModel;
-
-public final class ModelConfig {
-
-    private static final String BASE_URL = "https://api-vip.codex-for.me/v1";
-    private static final String MODEL_NAME = "gpt-5.2";
-    private static final String OLLAMA_BASE_URL = "http://localhost:11434";
-    private static final String OLLAMA_QWEN_MODEL_NAME = "qwen3.5:9b";
-    private static final String DEEPSEEK_API_MODEL_NAME = "deepseek-chat";
-
-    private ModelConfig() {
-    }
-
-    public static OpenAiStreamingChatModel openAiStreamingChatModel(String apiKey) {
-        return OpenAiStreamingChatModel.builder()
-                .apiKey(apiKey)
-                .modelName(MODEL_NAME)
-                .build();
-    }
-
-    public static OpenAiStreamingChatModel deepseekStreamingChatModel(String apiKey) {
-        return OpenAiStreamingChatModel.builder()
-                .apiKey(apiKey)
-                .baseUrl("https://api.deepseek.com")
-                .modelName(DEEPSEEK_API_MODEL_NAME)
-                .build();
-    }
-
-    public static GoogleAiGeminiChatModel googleAiGeminiChatModel(String apiKey) {
-        return GoogleAiGeminiChatModel.builder()
-                .apiKey(apiKey)
-                .modelName("gemini-2.5-flash")
-                .build();
-    }
-
-    public static OpenAiChatModel deepseekChatModel(String apiKey) {
-        return OpenAiChatModel.builder()
-                .apiKey(apiKey)
-                .baseUrl("https://api.deepseek.com")
-                .modelName(DEEPSEEK_API_MODEL_NAME)
-                .build();
-    }
-
-    public static OllamaChatModel ollamaQwenChatModel() {
-        String baseUrl = readEnvOrDefault("OLLAMA_BASE_URL", OLLAMA_BASE_URL);
-        String modelName = readEnvOrDefault("OLLAMA_MODEL_NAME", OLLAMA_QWEN_MODEL_NAME);
-
-        return OllamaChatModel.builder()
-                .baseUrl(baseUrl)
-                .modelName(modelName)
-                .build();
-    }
-
-    private static String readEnvOrDefault(String key, String defaultValue) {
-        String value = System.getenv(key);
-        return (value == null || value.isBlank()) ? defaultValue : value;
-    }
-}
-</file>
-
 <file path="src/main/resources/sql/chat_memory_category_migration.sql">
 -- Run this once on MySQL before deploying category-based chat memory storage.
 -- It upgrades chat_memory from (id, messages) to (id, category, messages).
@@ -817,6 +751,75 @@ Write-Output "MVN_CMD=$MAVEN_HOME/bin/$MVN_CMD"
 # Agent_learning
 </file>
 
+<file path="src/main/java/com/ai/project/ai_project/config/ModelConfig.java">
+package com.ai.project.ai_project.config;
+
+import dev.langchain4j.model.googleai.GoogleAiGeminiChatModel;
+import dev.langchain4j.model.openai.OpenAiChatModel;
+import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
+import dev.langchain4j.model.ollama.OllamaChatModel;
+
+import java.util.Map;
+
+public final class ModelConfig {
+
+    private static final String BASE_URL = "https://api-vip.codex-for.me/v1";
+    private static final String MODEL_NAME = "gpt-5.2";
+    private static final String OLLAMA_BASE_URL = "http://localhost:11434";
+    private static final String OLLAMA_QWEN_MODEL_NAME = "qwen3.5:9b";
+    private static final String DEEPSEEK_API_MODEL_NAME = "deepseek-v4-flash";
+
+    private ModelConfig() {
+    }
+
+    public static OpenAiStreamingChatModel openAiStreamingChatModel(String apiKey) {
+        return OpenAiStreamingChatModel.builder()
+                .apiKey(apiKey)
+                .modelName(MODEL_NAME)
+                .build();
+    }
+
+    public static OpenAiStreamingChatModel deepseekStreamingChatModel(String apiKey) {
+        return OpenAiStreamingChatModel.builder()
+                .apiKey(apiKey)
+                .baseUrl("https://api.deepseek.com")
+                .modelName(DEEPSEEK_API_MODEL_NAME)
+                .customParameters(Map.of("extra_body", Map.of("thinking", Map.of("type", "enabled"))))
+                .build();
+    }
+
+    public static GoogleAiGeminiChatModel googleAiGeminiChatModel(String apiKey) {
+        return GoogleAiGeminiChatModel.builder()
+                .apiKey(apiKey)
+                .modelName("gemini-2.5-flash")
+                .build();
+    }
+
+    public static OpenAiChatModel deepseekChatModel(String apiKey) {
+        return OpenAiChatModel.builder()
+                .apiKey(apiKey)
+                .baseUrl("https://api.deepseek.com")
+                .modelName(DEEPSEEK_API_MODEL_NAME)
+                .build();
+    }
+
+    public static OllamaChatModel ollamaQwenChatModel() {
+        String baseUrl = readEnvOrDefault("OLLAMA_BASE_URL", OLLAMA_BASE_URL);
+        String modelName = readEnvOrDefault("OLLAMA_MODEL_NAME", OLLAMA_QWEN_MODEL_NAME);
+
+        return OllamaChatModel.builder()
+                .baseUrl(baseUrl)
+                .modelName(modelName)
+                .build();
+    }
+
+    private static String readEnvOrDefault(String key, String defaultValue) {
+        String value = System.getenv(key);
+        return (value == null || value.isBlank()) ? defaultValue : value;
+    }
+}
+</file>
+
 <file path="src/main/java/com/ai/project/ai_project/config/MybatisConfig.java">
 package com.ai.project.ai_project.config;
 
@@ -1119,6 +1122,123 @@ public interface ChatMemoryMapper extends BaseMapper<ChatMemoryEntity> {
 }
 </file>
 
+<file path="src/main/java/com/ai/project/ai_project/tools/FinancialTools.java">
+package com.ai.project.ai_project.tools;
+
+import dev.langchain4j.agent.tool.Tool;
+import org.springframework.stereotype.Component;
+
+@Component
+public class FinancialTools {
+
+    @Tool("查询指定用户的银行账户余额")
+    public double getAccountBalance(String userName) {
+        System.out.println("--- 系统日志：AI 正在调用 Java 方法查询 [" + userName + "] 的余额 ---");
+        if ("张三".equals(userName)) return 1000.50;
+        if ("李四".equals(userName)) return 500.00;
+        return 0.0;
+    }
+
+    @Tool("申请贷款")
+    public double applyForLoan(String userName) {
+        System.out.println("--- 系统日志：AI 正在调用 Java 方法申请贷款 ---");
+        return 1000.0;
+    }
+}
+</file>
+
+<file path="src/main/java/com/ai/project/ai_project/AiProjectApplication.java">
+package com.ai.project.ai_project;
+
+import org.mybatis.spring.annotation.MapperScan;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+@MapperScan("com.ai.project.ai_project.mapper")
+public class AiProjectApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(AiProjectApplication.class, args);
+    }
+
+}
+</file>
+
+<file path="src/test/java/com/ai/project/ai_project/TalentServiceTest.java">
+package com.ai.project.ai_project;
+
+import com.ai.project.ai_project.service.TalentService;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+
+@SpringBootTest
+class TalentServiceTest {
+
+    @Autowired(required = false)
+    private TalentService talentService;
+
+    @Test
+    void testMultiUserMemoryIsolation() {
+        if (talentService == null) {
+            System.out.println("TalentService 未注入，请检查数据库连接和 Spring Boot 启动是否正常");
+            return;
+        }
+
+        // 用户 A 的对话
+        String userA = "user-A";
+        String resA1 = talentService.analyze(userA, "我是张三,帮我看看我有多少余额");
+        System.out.println("用户 A (张三) 结果 1：" + resA1);
+        String resA2 = talentService.analyze(userA, "我刚才申请贷款了吗");
+        System.out.println("用户 A (张三) 结果 2：" + resA2);
+
+        // 用户 B 的对话 (完全不同的上下文)
+        String userB = "user-B";
+        String resB1 = talentService.analyze(userB, "我是李四,帮我看看我有多少余额");
+        System.out.println("用户 B (李四) 结果 1：" + resB1);
+        String resB2 = talentService.analyze(userB, "我刚才问了什么");
+        System.out.println("用户 B (李四) 结果 2：" + resB2);
+    }
+}
+</file>
+
+<file path=".gitignore">
+HELP.md
+target/
+.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+build/
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### VS Code ###
+.vscode/
+</file>
+
 <file path="src/main/java/com/ai/project/ai_project/service/DocumentLoader.java">
 package com.ai.project.ai_project.service;
 
@@ -1129,29 +1249,33 @@ import dev.langchain4j.data.document.parser.apache.tika.ApacheTikaDocumentParser
 import dev.langchain4j.data.document.splitter.DocumentSplitters;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.output.Response;
-import dev.langchain4j.rag.query.Query;
-import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
-import dev.langchain4j.service.AiServices;
-import dev.langchain4j.service.SystemMessage;
-import dev.langchain4j.service.UserMessage;
+import dev.langchain4j.store.embedding.EmbeddingMatch;
+import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.filter.Filter;
 import dev.langchain4j.store.embedding.filter.logical.And;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
+import redis.clients.jedis.UnifiedJedis;
+import redis.clients.jedis.search.FTSearchParams;
+import redis.clients.jedis.search.SearchResult;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
 
@@ -1171,18 +1295,24 @@ public class DocumentLoader {
             "(19|20)\\d{2}[./-]\\d{1,2}\\s*[-~到至]\\s*((19|20)\\d{2}[./-]\\d{1,2}|至今|现在)"
     );
 
-    private final ChatLanguageModel chatLanguageModel;
+    private final ChatModel chatLanguageModel;
     private final EmbeddingModel embeddingModel;
     private final EmbeddingStore<TextSegment> embeddingStore;
+    private final UnifiedJedis unifiedJedis;
     private final ApacheTikaDocumentParser parser;
+    private final String vectorIndexName;
 
-    public DocumentLoader(ChatLanguageModel chatLanguageModel,
+    public DocumentLoader(ChatModel chatLanguageModel,
                           EmbeddingModel embeddingModel,
-                          EmbeddingStore<TextSegment> embeddingStore) {
+                          EmbeddingStore<TextSegment> embeddingStore,
+                          UnifiedJedis unifiedJedis,
+                          @org.springframework.beans.factory.annotation.Value("${app.vector.index-name:talent-index-v2}") String vectorIndexName) {
         this.chatLanguageModel = chatLanguageModel;
         this.embeddingModel = embeddingModel;
         this.embeddingStore = embeddingStore;
+        this.unifiedJedis = unifiedJedis;
         this.parser = new ApacheTikaDocumentParser();
+        this.vectorIndexName = vectorIndexName;
     }
 
     public UploadResult loadResume(String userId, MultipartFile file) throws IOException {
@@ -1367,34 +1497,172 @@ public class DocumentLoader {
                 metadataKey("sourceType").isEqualTo(SOURCE_TYPE_RESUME)
         );
 
-        EmbeddingStoreContentRetriever retriever = EmbeddingStoreContentRetriever.builder()
-                .embeddingStore(embeddingStore)
-                .embeddingModel(embeddingModel)
-                .maxResults(5)
+        String userIdKey = toHexKey(normalizedUserId);
+        EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
+                .queryEmbedding(embeddingModel.embed(query).content())
+                .maxResults(12)
                 .minScore(0.0)
                 .filter(filter)
                 .build();
 
-        if (retriever.retrieve(Query.from(query)).isEmpty()) {
+        List<EmbeddingMatch<TextSegment>> vectorMatches = searchVectorMatchesWithFallback(request, userIdKey);
+        List<KeywordHit> keywordHits = searchKeywordHits(normalizedUserId, query, 12);
+        if (vectorMatches.isEmpty() && keywordHits.isEmpty()) {
             return "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
         }
 
-        ResumeQaAssistant assistant = AiServices.builder(ResumeQaAssistant.class)
-                .chatLanguageModel(chatLanguageModel)
-                .contentRetriever(retriever)
-                .build();
+        List<String> parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, 4);
+        if (parentContexts.isEmpty()) {
+            return "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
+        }
 
-        return assistant.answer(query);
+        String mergedContext = String.join("\n\n---\n\n", parentContexts);
+        String prompt = """
+                你是一个简历分析助手。
+                你会收到按父块去重后的简历上下文，每个父块可能由多个子块检索命中后合并而来。
+                请优先理解 parentBlock 再回答，不要编造。
+                如果简历中没有相关信息，请明确回答：未在该用户简历中找到相关信息。
+
+                【简历上下文】
+                %s
+
+                【问题】
+                %s
+                """.formatted(mergedContext, query);
+        return chatLanguageModel.chat(prompt);
     }
 
+    private List<EmbeddingMatch<TextSegment>> searchVectorMatchesWithFallback(EmbeddingSearchRequest request,
+                                                                               String userIdKey) {
+        List<EmbeddingMatch<TextSegment>> primary = embeddingStore.search(request).matches();
+        if (!primary.isEmpty()) {
+            return primary;
+        }
 
-    interface ResumeQaAssistant {
-        @SystemMessage("""
-                你是一个简历分析助手。
-                请仅基于检索到的简历内容回答问题，不要编造。
-                如果简历中没有相关信息，请明确回答：未在该用户简历中找到相关信息。
-                """)
-        String answer(@UserMessage String question);
+        // Fallback for schema/version drift: retrieve without filter and apply metadata filtering in JVM.
+        EmbeddingSearchRequest fallbackRequest = EmbeddingSearchRequest.builder()
+                .queryEmbedding(request.queryEmbedding())
+                .maxResults(50)
+                .minScore(0.0)
+                .build();
+        return embeddingStore.search(fallbackRequest).matches().stream()
+                .filter(match -> match.embedded() != null && match.embedded().metadata() != null)
+                .filter(match -> SOURCE_TYPE_RESUME.equals(safe(match.embedded().metadata().getString("sourceType"))))
+                .filter(match -> userIdKey.equals(safe(match.embedded().metadata().getString("userIdKey"))))
+                .limit(12)
+                .toList();
+    }
+
+    private List<String> collectHybridParentContexts(List<EmbeddingMatch<TextSegment>> vectorMatches,
+                                                     List<KeywordHit> keywordHits,
+                                                     int maxParents) {
+        Map<String, ParentCandidate> candidates = new LinkedHashMap<>();
+
+        for (int i = 0; i < vectorMatches.size(); i++) {
+            EmbeddingMatch<TextSegment> match = vectorMatches.get(i);
+            TextSegment segment = match.embedded();
+            if (segment == null) {
+                continue;
+            }
+            Metadata metadata = segment.metadata();
+            String parentIndex = metadata == null ? "" : safe(metadata.getString("parentIndex"));
+            String parentType = metadata == null ? "" : safe(metadata.getString("parentType"));
+            String parentBlock = metadata == null ? "" : safe(metadata.getString("parentBlock"));
+            String fallback = safe(segment.text());
+
+            String parentKey = parentIndex.isBlank() ? "fallback-" + fallback.hashCode() : parentIndex;
+            String context = parentBlock.isBlank() ? fallback : parentBlock;
+            double score = reciprocalRank(i);
+
+            ParentCandidate incoming = new ParentCandidate(parentKey, parentType, context, score);
+            ParentCandidate existing = candidates.get(parentKey);
+            if (existing == null || incoming.score() > existing.score()) {
+                candidates.put(parentKey, incoming);
+            }
+        }
+
+        for (int i = 0; i < keywordHits.size(); i++) {
+            KeywordHit hit = keywordHits.get(i);
+            String parentKey = hit.parentIndex().isBlank() ? "kw-" + i : hit.parentIndex();
+            ParentCandidate existing = candidates.get(parentKey);
+            double score = reciprocalRank(i);
+            if (existing == null) {
+                candidates.put(parentKey, new ParentCandidate(parentKey, hit.parentType(), hit.parentBlock(), score));
+            } else {
+                candidates.put(parentKey, new ParentCandidate(
+                        existing.parentKey(),
+                        existing.parentType().isBlank() ? hit.parentType() : existing.parentType(),
+                        existing.context().isBlank() ? hit.parentBlock() : existing.context(),
+                        existing.score() + score
+                ));
+            }
+        }
+
+        return candidates.values().stream()
+                .sorted(Comparator.comparingDouble(ParentCandidate::score).reversed())
+                .limit(maxParents)
+                .map(candidate -> {
+                    String type = candidate.parentType().isBlank() ? "resume" : candidate.parentType();
+                    return "【parentType=" + type + ", parentIndex=" + candidate.parentKey() + "】\n" + candidate.context();
+                })
+                .toList();
+    }
+
+    private List<KeywordHit> searchKeywordHits(String normalizedUserId, String query, int limit) {
+        try {
+            String userIdKey = toHexKey(normalizedUserId);
+            String escapedQuery = escapeRedisTextQuery(query);
+            String redisQuery = "@userIdKey:{" + userIdKey + "} @sourceType:{resume} @parentBlock:(" + escapedQuery + ")";
+            FTSearchParams params = FTSearchParams.searchParams()
+                    .limit(0, limit)
+                    .returnFields("parentType", "parentIndex", "parentBlock")
+                    .dialect(2);
+            SearchResult result = unifiedJedis.ftSearch(vectorIndexName, redisQuery, params);
+            if (result == null || result.getDocuments() == null) {
+                return List.of();
+            }
+            return result.getDocuments().stream()
+                    .map(this::toKeywordHit)
+                    .filter(hit -> !hit.parentBlock().isBlank())
+                    .toList();
+        } catch (Exception ignored) {
+            return List.of();
+        }
+    }
+
+    private KeywordHit toKeywordHit(redis.clients.jedis.search.Document doc) {
+        if (doc == null) {
+            return new KeywordHit("", "", "");
+        }
+        return new KeywordHit(
+                safe(doc.getString("parentType")),
+                safe(doc.getString("parentIndex")),
+                safe(doc.getString("parentBlock"))
+        );
+    }
+
+    private String escapeRedisTextQuery(String query) {
+        String normalized = safe(query);
+        if (normalized.isBlank()) {
+            return "\"\"";
+        }
+        List<String> tokens = Pattern.compile("[\\s,，。！？；;:：()（）]+")
+                .splitAsStream(normalized)
+                .filter(token -> !token.isBlank())
+                .map(token -> token.replaceAll("([\\\\@{}\\[\\]\\(\\)\\|\\-!~\"'])", "\\\\$1"))
+                .toList();
+        if (tokens.isEmpty()) {
+            return "\"" + normalized + "\"";
+        }
+        return tokens.stream().collect(Collectors.joining(" | "));
+    }
+
+    private double reciprocalRank(int rankIndex) {
+        return 1.0d / (rankIndex + 60.0d);
+    }
+
+    private String safe(String value) {
+        return value == null ? "" : value.trim();
     }
 
     private String toHexKey(String raw) {
@@ -1417,6 +1685,12 @@ public class DocumentLoader {
     private record ParentBlock(String type, String content) {
     }
 
+    private record ParentCandidate(String parentKey, String parentType, String context, double score) {
+    }
+
+    private record KeywordHit(String parentType, String parentIndex, String parentBlock) {
+    }
+
     public record UploadResult(
             String userId,
             String fileName,
@@ -1429,121 +1703,29 @@ public class DocumentLoader {
 }
 </file>
 
-<file path="src/main/java/com/ai/project/ai_project/tools/FinancialTools.java">
-package com.ai.project.ai_project.tools;
+<file path="src/main/resources/application.properties">
+spring.application.name=ai_project
+spring.datasource.url=jdbc:mysql://localhost:3306/ai_project?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true
+spring.datasource.username=root
+spring.datasource.password=root
+spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
 
-import dev.langchain4j.agent.tool.Tool;
-import org.springframework.stereotype.Component;
+# Redis (local deployment)
+spring.data.redis.host=localhost
+spring.data.redis.port=6379
 
-@Component
-public class FinancialTools {
+# Vector index with metadata filter fields (v2 avoids old incompatible schema)
+app.vector.index-name=talent-index-v2
+app.vector.prefix=talent:v2:
 
-    @Tool("查询指定用户的银行账户余额")
-    public double getAccountBalance(String userName) {
-        System.out.println("--- 系统日志：AI 正在调用 Java 方法查询 [" + userName + "] 的余额 ---");
-        if ("张三".equals(userName)) return 1000.50;
-        if ("李四".equals(userName)) return 500.00;
-        return 0.0;
-    }
+# MyBatis-Plus Config
+mybatis-plus.type-aliases-package=com.ai.project.ai_project.domain
+mybatis-plus.global-config.db-config.id-type=auto
 
-    @Tool("申请贷款")
-    public double applyForLoan(String userName) {
-        System.out.println("--- 系统日志：AI 正在调用 Java 方法申请贷款 ---");
-        return 1000.0;
-    }
-}
-</file>
-
-<file path="src/main/java/com/ai/project/ai_project/AiProjectApplication.java">
-package com.ai.project.ai_project;
-
-import org.mybatis.spring.annotation.MapperScan;
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
-
-@SpringBootApplication
-@MapperScan("com.ai.project.ai_project.mapper")
-public class AiProjectApplication {
-
-    public static void main(String[] args) {
-        SpringApplication.run(AiProjectApplication.class, args);
-    }
-
-}
-</file>
-
-<file path="src/test/java/com/ai/project/ai_project/TalentServiceTest.java">
-package com.ai.project.ai_project;
-
-import com.ai.project.ai_project.service.TalentService;
-import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
-
-@SpringBootTest
-class TalentServiceTest {
-
-    @Autowired(required = false)
-    private TalentService talentService;
-
-    @Test
-    void testMultiUserMemoryIsolation() {
-        if (talentService == null) {
-            System.out.println("TalentService 未注入，请检查数据库连接和 Spring Boot 启动是否正常");
-            return;
-        }
-
-        // 用户 A 的对话
-        String userA = "user-A";
-        String resA1 = talentService.analyze(userA, "我是张三,帮我看看我有多少余额");
-        System.out.println("用户 A (张三) 结果 1：" + resA1);
-        String resA2 = talentService.analyze(userA, "我刚才申请贷款了吗");
-        System.out.println("用户 A (张三) 结果 2：" + resA2);
-
-        // 用户 B 的对话 (完全不同的上下文)
-        String userB = "user-B";
-        String resB1 = talentService.analyze(userB, "我是李四,帮我看看我有多少余额");
-        System.out.println("用户 B (李四) 结果 1：" + resB1);
-        String resB2 = talentService.analyze(userB, "我刚才问了什么");
-        System.out.println("用户 B (李四) 结果 2：" + resB2);
-    }
-}
-</file>
-
-<file path=".gitignore">
-HELP.md
-target/
-.mvn/wrapper/maven-wrapper.jar
-!**/src/main/**/target/
-!**/src/test/**/target/
-
-### STS ###
-.apt_generated
-.classpath
-.factorypath
-.project
-.settings
-.springBeans
-.sts4-cache
-
-### IntelliJ IDEA ###
-.idea
-*.iws
-*.iml
-*.ipr
-
-### NetBeans ###
-/nbproject/private/
-/nbbuild/
-/dist/
-/nbdist/
-/.nb-gradle/
-build/
-!**/src/main/**/build/
-!**/src/test/**/build/
-
-### VS Code ###
-.vscode/
+# AI API Keys (from environment variables)
+GEMINI_AI_KEY=${GEMINI_AI_KEY}
+OPENAI_API_KEY=${OPENAI_API_KEY}
+DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
 </file>
 
 <file path="src/main/java/com/ai/project/ai_project/service/TalentService.java">
@@ -1552,8 +1734,8 @@ package com.ai.project.ai_project.service;
 import com.ai.project.ai_project.tools.FinancialTools;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
-import dev.langchain4j.model.chat.ChatLanguageModel;
-import dev.langchain4j.model.chat.StreamingChatLanguageModel;
+import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
 import dev.langchain4j.service.AiServices;
@@ -1577,8 +1759,8 @@ public class TalentService {
     private static final String MEMORY_CATEGORY = "talent";
     private static final String MEMORY_SCOPE_SEPARATOR = "::";
 
-    private final ChatLanguageModel chatLanguageModel;
-    private final StreamingChatLanguageModel streamingChatLanguageModel;
+    private final ChatModel chatLanguageModel;
+    private final StreamingChatModel streamingChatLanguageModel;
     private final EmbeddingModel embeddingModel;
     private final EmbeddingStore<TextSegment> embeddingStore;
     private final ChatMemoryStore chatMemoryStore;
@@ -1587,8 +1769,8 @@ public class TalentService {
     private TalentAnalyst analyst;
     private StreamingTalentAnalyst streamingAnalyst;
 
-    public TalentService(ChatLanguageModel chatLanguageModel,
-                         StreamingChatLanguageModel streamingChatLanguageModel,
+    public TalentService(ChatModel chatLanguageModel,
+                         StreamingChatModel streamingChatLanguageModel,
                          EmbeddingModel embeddingModel,
                          EmbeddingStore<TextSegment> embeddingStore,
                          ChatMemoryStore chatMemoryStore,
@@ -1622,7 +1804,7 @@ public class TalentService {
                 .build();
 
         this.analyst = AiServices.builder(TalentAnalyst.class)
-                .chatLanguageModel(chatLanguageModel)
+                .chatModel(chatLanguageModel)
                 .chatMemoryProvider(memoryId -> MessageWindowChatMemory.builder()
                         .id(memoryId)
                         .maxMessages(10)
@@ -1633,7 +1815,7 @@ public class TalentService {
                 .build();
 
         this.streamingAnalyst = AiServices.builder(StreamingTalentAnalyst.class)
-                .streamingChatLanguageModel(streamingChatLanguageModel)
+                .streamingChatModel(streamingChatLanguageModel)
                 .chatMemoryProvider(memoryId -> MessageWindowChatMemory.builder()
                         .id(memoryId)
                         .maxMessages(10)
@@ -1683,31 +1865,6 @@ public class TalentService {
 }
 </file>
 
-<file path="src/main/resources/application.properties">
-spring.application.name=ai_project
-spring.datasource.url=jdbc:mysql://localhost:3306/ai_project?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true
-spring.datasource.username=root
-spring.datasource.password=root
-spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
-
-# Redis (local deployment)
-spring.data.redis.host=localhost
-spring.data.redis.port=6379
-
-# Vector index with metadata filter fields (v2 avoids old incompatible schema)
-app.vector.index-name=talent-index-v2
-app.vector.prefix=talent:v2:
-
-# MyBatis-Plus Config
-mybatis-plus.type-aliases-package=com.ai.project.ai_project.domain
-mybatis-plus.global-config.db-config.id-type=auto
-
-# AI API Keys (from environment variables)
-GEMINI_AI_KEY=${GEMINI_AI_KEY}
-OPENAI_API_KEY=${OPENAI_API_KEY}
-DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
-</file>
-
 <file path="src/main/java/com/ai/project/ai_project/config/LangChainConfig.java">
 package com.ai.project.ai_project.config;
 
@@ -1716,8 +1873,8 @@ import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.ChatMessageDeserializer;
 import dev.langchain4j.data.message.ChatMessageSerializer;
 import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.model.chat.ChatLanguageModel;
-import dev.langchain4j.model.chat.StreamingChatLanguageModel;
+import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
 import dev.langchain4j.community.store.embedding.redis.RedisEmbeddingStore;
@@ -1728,9 +1885,14 @@ import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import redis.clients.jedis.HostAndPort;
+import redis.clients.jedis.UnifiedJedis;
+import redis.clients.jedis.search.schemafields.TagField;
+import redis.clients.jedis.search.schemafields.TextField;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 @Configuration
 public class LangChainConfig {
@@ -1759,12 +1921,12 @@ public class LangChainConfig {
     private String vectorPrefix;
 
     @Bean
-    public ChatLanguageModel chatLanguageModel() {
+    public ChatModel chatLanguageModel() {
         return ModelConfig.deepseekChatModel(deepseekApiKey);
     }
 
     @Bean
-    public StreamingChatLanguageModel streamingChatLanguageModel() {
+    public StreamingChatModel streamingChatLanguageModel() {
         return ModelConfig.deepseekStreamingChatModel(deepseekApiKey);
     }
 
@@ -1781,19 +1943,24 @@ public class LangChainConfig {
                 .dimension(384)
                 .indexName(vectorIndexName)
                 .prefix(vectorPrefix)
-                .metadataKeys(List.of(
-                        "userIdKey",
-                        "sourceType",
-                        "userId",
-                        "fileName",
-                        "contentType",
-                        "uploadedAt",
-                        "parentType",
-                        "parentIndex",
-                        "parentBlock",
-                        "childIndex"
+                .metadataConfig(Map.of(
+                        "userIdKey", TagField.of("$.userIdKey").as("userIdKey"),
+                        "sourceType", TagField.of("$.sourceType").as("sourceType"),
+                        "userId", TagField.of("$.userId").as("userId"),
+                        "fileName", TextField.of("$.fileName").as("fileName"),
+                        "contentType", TagField.of("$.contentType").as("contentType"),
+                        "uploadedAt", TagField.of("$.uploadedAt").as("uploadedAt"),
+                        "parentType", TagField.of("$.parentType").as("parentType"),
+                        "parentIndex", TagField.of("$.parentIndex").as("parentIndex"),
+                        "parentBlock", TextField.of("$.parentBlock").as("parentBlock"),
+                        "childIndex", TagField.of("$.childIndex").as("childIndex")
                 ))
                 .build();
+    }
+
+    @Bean
+    public UnifiedJedis unifiedJedis() {
+        return new UnifiedJedis(new HostAndPort(redisHost, redisPort));
     }
 
     @Bean
@@ -1884,37 +2051,45 @@ public class LangChainConfig {
     </scm>
     <properties>
         <java.version>17</java.version>
+        <langchain4j.version>1.13.0</langchain4j.version>
+        <langchain4j.openai.version>1.13.1</langchain4j.openai.version>
+        <langchain4j.google.gemini.version>1.7.1</langchain4j.google.gemini.version>
+        <langchain4j.ollama.version>1.13.1</langchain4j.ollama.version>
+        <langchain4j.community.redis.version>1.9.1-beta17</langchain4j.community.redis.version>
+        <langchain4j.easyrag.version>1.13.0-beta23</langchain4j.easyrag.version>
+        <langchain4j.docparser.tika.version>1.13.0-beta23</langchain4j.docparser.tika.version>
+        <langchain4j.embedding.minilmq.version>1.11.0-beta19</langchain4j.embedding.minilmq.version>
     </properties>
     <dependencies>
         <dependency>
             <groupId>dev.langchain4j</groupId>
             <artifactId>langchain4j</artifactId>
-            <version>1.0.0-beta3</version>
+            <version>${langchain4j.version}</version>
         </dependency>
         <dependency>
             <groupId>dev.langchain4j</groupId>
             <artifactId>langchain4j-open-ai</artifactId>
-            <version>1.0.0-beta3</version>
+            <version>${langchain4j.openai.version}</version>
         </dependency>
         <dependency>
             <groupId>dev.langchain4j</groupId>
             <artifactId>langchain4j-google-ai-gemini</artifactId>
-            <version>1.0.0-beta3</version>
+            <version>${langchain4j.google.gemini.version}</version>
         </dependency>
         <dependency>
             <groupId>dev.langchain4j</groupId>
             <artifactId>langchain4j-embeddings-all-minilm-l6-v2-q</artifactId>
-            <version>1.0.0-beta3</version>
+            <version>${langchain4j.embedding.minilmq.version}</version>
         </dependency>
         <dependency>
             <groupId>dev.langchain4j</groupId>
             <artifactId>langchain4j-ollama</artifactId>
-            <version>1.0.0-beta3</version>
+            <version>${langchain4j.ollama.version}</version>
         </dependency>
         <dependency>
             <groupId>dev.langchain4j</groupId>
             <artifactId>langchain4j-community-redis</artifactId>
-            <version>1.0.0-beta3</version>
+            <version>${langchain4j.community.redis.version}</version>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -1923,12 +2098,12 @@ public class LangChainConfig {
         <dependency>
             <groupId>dev.langchain4j</groupId>
             <artifactId>langchain4j-easy-rag</artifactId>
-            <version>1.0.0-beta3</version>
+            <version>${langchain4j.easyrag.version}</version>
         </dependency>
         <dependency>
             <groupId>dev.langchain4j</groupId>
             <artifactId>langchain4j-document-parser-apache-tika</artifactId>
-            <version>1.0.0-beta3</version>
+            <version>${langchain4j.docparser.tika.version}</version>
         </dependency>
         <dependency>
             <groupId>com.baomidou</groupId>
