@@ -17,9 +17,14 @@ import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import redis.clients.jedis.HostAndPort;
+import redis.clients.jedis.UnifiedJedis;
+import redis.clients.jedis.search.schemafields.TagField;
+import redis.clients.jedis.search.schemafields.TextField;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 @Configuration
 public class LangChainConfig {
@@ -70,19 +75,24 @@ public class LangChainConfig {
                 .dimension(384)
                 .indexName(vectorIndexName)
                 .prefix(vectorPrefix)
-                .metadataKeys(List.of(
-                        "userIdKey",
-                        "sourceType",
-                        "userId",
-                        "fileName",
-                        "contentType",
-                        "uploadedAt",
-                        "parentType",
-                        "parentIndex",
-                        "parentBlock",
-                        "childIndex"
+                .metadataConfig(Map.of(
+                        "userIdKey", TagField.of("$.userIdKey").as("userIdKey"),
+                        "sourceType", TagField.of("$.sourceType").as("sourceType"),
+                        "userId", TagField.of("$.userId").as("userId"),
+                        "fileName", TextField.of("$.fileName").as("fileName"),
+                        "contentType", TagField.of("$.contentType").as("contentType"),
+                        "uploadedAt", TagField.of("$.uploadedAt").as("uploadedAt"),
+                        "parentType", TagField.of("$.parentType").as("parentType"),
+                        "parentIndex", TagField.of("$.parentIndex").as("parentIndex"),
+                        "parentBlock", TextField.of("$.parentBlock").as("parentBlock"),
+                        "childIndex", TagField.of("$.childIndex").as("childIndex")
                 ))
                 .build();
+    }
+
+    @Bean
+    public UnifiedJedis unifiedJedis() {
+        return new UnifiedJedis(new HostAndPort(redisHost, redisPort));
     }
 
     @Bean

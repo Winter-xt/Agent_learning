@@ -17,6 +17,9 @@ import dev.langchain4j.store.embedding.filter.Filter;
 import dev.langchain4j.store.embedding.filter.logical.And;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
+import redis.clients.jedis.UnifiedJedis;
+import redis.clients.jedis.search.FTSearchParams;
+import redis.clients.jedis.search.SearchResult;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -30,6 +33,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
 
@@ -52,15 +56,21 @@ public class DocumentLoader {
     private final ChatModel chatLanguageModel;
     private final EmbeddingModel embeddingModel;
     private final EmbeddingStore<TextSegment> embeddingStore;
+    private final UnifiedJedis unifiedJedis;
     private final ApacheTikaDocumentParser parser;
+    private final String vectorIndexName;
 
     public DocumentLoader(ChatModel chatLanguageModel,
                           EmbeddingModel embeddingModel,
-                          EmbeddingStore<TextSegment> embeddingStore) {
+                          EmbeddingStore<TextSegment> embeddingStore,
+                          UnifiedJedis unifiedJedis,
+                          @org.springframework.beans.factory.annotation.Value("${app.vector.index-name:talent-index-v2}") String vectorIndexName) {
         this.chatLanguageModel = chatLanguageModel;
         this.embeddingModel = embeddingModel;
         this.embeddingStore = embeddingStore;
+        this.unifiedJedis = unifiedJedis;
         this.parser = new ApacheTikaDocumentParser();
+        this.vectorIndexName = vectorIndexName;
     }
 
     public UploadResult loadResume(String userId, MultipartFile file) throws IOException {
@@ -245,6 +255,7 @@ public class DocumentLoader {
                 metadataKey("sourceType").isEqualTo(SOURCE_TYPE_RESUME)
         );
 
+        String userIdKey = toHexKey(normalizedUserId);
         EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
                 .queryEmbedding(embeddingModel.embed(query).content())
                 .maxResults(12)
@@ -252,12 +263,13 @@ public class DocumentLoader {
                 .filter(filter)
                 .build();
 
-        List<EmbeddingMatch<TextSegment>> matches = embeddingStore.search(request).matches();
-        if (matches.isEmpty()) {
+        List<EmbeddingMatch<TextSegment>> vectorMatches = searchVectorMatchesWithFallback(request, userIdKey);
+        List<KeywordHit> keywordHits = searchKeywordHits(normalizedUserId, query, 12);
+        if (vectorMatches.isEmpty() && keywordHits.isEmpty()) {
             return "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
         }
 
-        List<String> parentContexts = collectUniqueParentContexts(matches, 4);
+        List<String> parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, 4);
         if (parentContexts.isEmpty()) {
             return "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
         }
@@ -278,10 +290,34 @@ public class DocumentLoader {
         return chatLanguageModel.chat(prompt);
     }
 
-    private List<String> collectUniqueParentContexts(List<EmbeddingMatch<TextSegment>> matches, int maxParents) {
+    private List<EmbeddingMatch<TextSegment>> searchVectorMatchesWithFallback(EmbeddingSearchRequest request,
+                                                                               String userIdKey) {
+        List<EmbeddingMatch<TextSegment>> primary = embeddingStore.search(request).matches();
+        if (!primary.isEmpty()) {
+            return primary;
+        }
+
+        // Fallback for schema/version drift: retrieve without filter and apply metadata filtering in JVM.
+        EmbeddingSearchRequest fallbackRequest = EmbeddingSearchRequest.builder()
+                .queryEmbedding(request.queryEmbedding())
+                .maxResults(50)
+                .minScore(0.0)
+                .build();
+        return embeddingStore.search(fallbackRequest).matches().stream()
+                .filter(match -> match.embedded() != null && match.embedded().metadata() != null)
+                .filter(match -> SOURCE_TYPE_RESUME.equals(safe(match.embedded().metadata().getString("sourceType"))))
+                .filter(match -> userIdKey.equals(safe(match.embedded().metadata().getString("userIdKey"))))
+                .limit(12)
+                .toList();
+    }
+
+    private List<String> collectHybridParentContexts(List<EmbeddingMatch<TextSegment>> vectorMatches,
+                                                     List<KeywordHit> keywordHits,
+                                                     int maxParents) {
         Map<String, ParentCandidate> candidates = new LinkedHashMap<>();
 
-        for (EmbeddingMatch<TextSegment> match : matches) {
+        for (int i = 0; i < vectorMatches.size(); i++) {
+            EmbeddingMatch<TextSegment> match = vectorMatches.get(i);
             TextSegment segment = match.embedded();
             if (segment == null) {
                 continue;
@@ -294,12 +330,29 @@ public class DocumentLoader {
 
             String parentKey = parentIndex.isBlank() ? "fallback-" + fallback.hashCode() : parentIndex;
             String context = parentBlock.isBlank() ? fallback : parentBlock;
-            double score = match.score() == null ? 0.0 : match.score();
+            double score = reciprocalRank(i);
 
             ParentCandidate incoming = new ParentCandidate(parentKey, parentType, context, score);
             ParentCandidate existing = candidates.get(parentKey);
             if (existing == null || incoming.score() > existing.score()) {
                 candidates.put(parentKey, incoming);
+            }
+        }
+
+        for (int i = 0; i < keywordHits.size(); i++) {
+            KeywordHit hit = keywordHits.get(i);
+            String parentKey = hit.parentIndex().isBlank() ? "kw-" + i : hit.parentIndex();
+            ParentCandidate existing = candidates.get(parentKey);
+            double score = reciprocalRank(i);
+            if (existing == null) {
+                candidates.put(parentKey, new ParentCandidate(parentKey, hit.parentType(), hit.parentBlock(), score));
+            } else {
+                candidates.put(parentKey, new ParentCandidate(
+                        existing.parentKey(),
+                        existing.parentType().isBlank() ? hit.parentType() : existing.parentType(),
+                        existing.context().isBlank() ? hit.parentBlock() : existing.context(),
+                        existing.score() + score
+                ));
             }
         }
 
@@ -311,6 +364,59 @@ public class DocumentLoader {
                     return "【parentType=" + type + ", parentIndex=" + candidate.parentKey() + "】\n" + candidate.context();
                 })
                 .toList();
+    }
+
+    private List<KeywordHit> searchKeywordHits(String normalizedUserId, String query, int limit) {
+        try {
+            String userIdKey = toHexKey(normalizedUserId);
+            String escapedQuery = escapeRedisTextQuery(query);
+            String redisQuery = "@userIdKey:{" + userIdKey + "} @sourceType:{resume} @parentBlock:(" + escapedQuery + ")";
+            FTSearchParams params = FTSearchParams.searchParams()
+                    .limit(0, limit)
+                    .returnFields("parentType", "parentIndex", "parentBlock")
+                    .dialect(2);
+            SearchResult result = unifiedJedis.ftSearch(vectorIndexName, redisQuery, params);
+            if (result == null || result.getDocuments() == null) {
+                return List.of();
+            }
+            return result.getDocuments().stream()
+                    .map(this::toKeywordHit)
+                    .filter(hit -> !hit.parentBlock().isBlank())
+                    .toList();
+        } catch (Exception ignored) {
+            return List.of();
+        }
+    }
+
+    private KeywordHit toKeywordHit(redis.clients.jedis.search.Document doc) {
+        if (doc == null) {
+            return new KeywordHit("", "", "");
+        }
+        return new KeywordHit(
+                safe(doc.getString("parentType")),
+                safe(doc.getString("parentIndex")),
+                safe(doc.getString("parentBlock"))
+        );
+    }
+
+    private String escapeRedisTextQuery(String query) {
+        String normalized = safe(query);
+        if (normalized.isBlank()) {
+            return "\"\"";
+        }
+        List<String> tokens = Pattern.compile("[\\s,，。！？；;:：()（）]+")
+                .splitAsStream(normalized)
+                .filter(token -> !token.isBlank())
+                .map(token -> token.replaceAll("([\\\\@{}\\[\\]\\(\\)\\|\\-!~\"'])", "\\\\$1"))
+                .toList();
+        if (tokens.isEmpty()) {
+            return "\"" + normalized + "\"";
+        }
+        return tokens.stream().collect(Collectors.joining(" | "));
+    }
+
+    private double reciprocalRank(int rankIndex) {
+        return 1.0d / (rankIndex + 60.0d);
     }
 
     private String safe(String value) {
@@ -338,6 +444,9 @@ public class DocumentLoader {
     }
 
     private record ParentCandidate(String parentKey, String parentType, String context, double score) {
+    }
+
+    private record KeywordHit(String parentType, String parentIndex, String parentBlock) {
     }
 
     public record UploadResult(
