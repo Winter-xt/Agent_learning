@@ -7,14 +7,11 @@ import dev.langchain4j.data.document.parser.apache.tika.ApacheTikaDocumentParser
 import dev.langchain4j.data.document.splitter.DocumentSplitters;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.output.Response;
-import dev.langchain4j.rag.query.Query;
-import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
-import dev.langchain4j.service.AiServices;
-import dev.langchain4j.service.SystemMessage;
-import dev.langchain4j.service.UserMessage;
+import dev.langchain4j.store.embedding.EmbeddingMatch;
+import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.filter.Filter;
 import dev.langchain4j.store.embedding.filter.logical.And;
@@ -26,8 +23,11 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 
@@ -49,12 +49,12 @@ public class DocumentLoader {
             "(19|20)\\d{2}[./-]\\d{1,2}\\s*[-~到至]\\s*((19|20)\\d{2}[./-]\\d{1,2}|至今|现在)"
     );
 
-    private final ChatLanguageModel chatLanguageModel;
+    private final ChatModel chatLanguageModel;
     private final EmbeddingModel embeddingModel;
     private final EmbeddingStore<TextSegment> embeddingStore;
     private final ApacheTikaDocumentParser parser;
 
-    public DocumentLoader(ChatLanguageModel chatLanguageModel,
+    public DocumentLoader(ChatModel chatLanguageModel,
                           EmbeddingModel embeddingModel,
                           EmbeddingStore<TextSegment> embeddingStore) {
         this.chatLanguageModel = chatLanguageModel;
@@ -245,34 +245,76 @@ public class DocumentLoader {
                 metadataKey("sourceType").isEqualTo(SOURCE_TYPE_RESUME)
         );
 
-        EmbeddingStoreContentRetriever retriever = EmbeddingStoreContentRetriever.builder()
-                .embeddingStore(embeddingStore)
-                .embeddingModel(embeddingModel)
-                .maxResults(5)
+        EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
+                .queryEmbedding(embeddingModel.embed(query).content())
+                .maxResults(12)
                 .minScore(0.0)
                 .filter(filter)
                 .build();
 
-        if (retriever.retrieve(Query.from(query)).isEmpty()) {
+        List<EmbeddingMatch<TextSegment>> matches = embeddingStore.search(request).matches();
+        if (matches.isEmpty()) {
             return "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
         }
 
-        ResumeQaAssistant assistant = AiServices.builder(ResumeQaAssistant.class)
-                .chatLanguageModel(chatLanguageModel)
-                .contentRetriever(retriever)
-                .build();
+        List<String> parentContexts = collectUniqueParentContexts(matches, 4);
+        if (parentContexts.isEmpty()) {
+            return "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
+        }
 
-        return assistant.answer(query);
+        String mergedContext = String.join("\n\n---\n\n", parentContexts);
+        String prompt = """
+                你是一个简历分析助手。
+                你会收到按父块去重后的简历上下文，每个父块可能由多个子块检索命中后合并而来。
+                请优先理解 parentBlock 再回答，不要编造。
+                如果简历中没有相关信息，请明确回答：未在该用户简历中找到相关信息。
+
+                【简历上下文】
+                %s
+
+                【问题】
+                %s
+                """.formatted(mergedContext, query);
+        return chatLanguageModel.chat(prompt);
     }
 
+    private List<String> collectUniqueParentContexts(List<EmbeddingMatch<TextSegment>> matches, int maxParents) {
+        Map<String, ParentCandidate> candidates = new LinkedHashMap<>();
 
-    interface ResumeQaAssistant {
-        @SystemMessage("""
-                你是一个简历分析助手。
-                请仅基于检索到的简历内容回答问题，不要编造。
-                如果简历中没有相关信息，请明确回答：未在该用户简历中找到相关信息。
-                """)
-        String answer(@UserMessage String question);
+        for (EmbeddingMatch<TextSegment> match : matches) {
+            TextSegment segment = match.embedded();
+            if (segment == null) {
+                continue;
+            }
+            Metadata metadata = segment.metadata();
+            String parentIndex = metadata == null ? "" : safe(metadata.getString("parentIndex"));
+            String parentType = metadata == null ? "" : safe(metadata.getString("parentType"));
+            String parentBlock = metadata == null ? "" : safe(metadata.getString("parentBlock"));
+            String fallback = safe(segment.text());
+
+            String parentKey = parentIndex.isBlank() ? "fallback-" + fallback.hashCode() : parentIndex;
+            String context = parentBlock.isBlank() ? fallback : parentBlock;
+            double score = match.score() == null ? 0.0 : match.score();
+
+            ParentCandidate incoming = new ParentCandidate(parentKey, parentType, context, score);
+            ParentCandidate existing = candidates.get(parentKey);
+            if (existing == null || incoming.score() > existing.score()) {
+                candidates.put(parentKey, incoming);
+            }
+        }
+
+        return candidates.values().stream()
+                .sorted(Comparator.comparingDouble(ParentCandidate::score).reversed())
+                .limit(maxParents)
+                .map(candidate -> {
+                    String type = candidate.parentType().isBlank() ? "resume" : candidate.parentType();
+                    return "【parentType=" + type + ", parentIndex=" + candidate.parentKey() + "】\n" + candidate.context();
+                })
+                .toList();
+    }
+
+    private String safe(String value) {
+        return value == null ? "" : value.trim();
     }
 
     private String toHexKey(String raw) {
@@ -293,6 +335,9 @@ public class DocumentLoader {
     }
 
     private record ParentBlock(String type, String content) {
+    }
+
+    private record ParentCandidate(String parentKey, String parentType, String context, double score) {
     }
 
     public record UploadResult(

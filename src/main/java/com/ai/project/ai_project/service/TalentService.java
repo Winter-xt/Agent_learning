@@ -3,8 +3,8 @@ package com.ai.project.ai_project.service;
 import com.ai.project.ai_project.tools.FinancialTools;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
-import dev.langchain4j.model.chat.ChatLanguageModel;
-import dev.langchain4j.model.chat.StreamingChatLanguageModel;
+import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
 import dev.langchain4j.service.AiServices;
@@ -28,8 +28,8 @@ public class TalentService {
     private static final String MEMORY_CATEGORY = "talent";
     private static final String MEMORY_SCOPE_SEPARATOR = "::";
 
-    private final ChatLanguageModel chatLanguageModel;
-    private final StreamingChatLanguageModel streamingChatLanguageModel;
+    private final ChatModel chatLanguageModel;
+    private final StreamingChatModel streamingChatLanguageModel;
     private final EmbeddingModel embeddingModel;
     private final EmbeddingStore<TextSegment> embeddingStore;
     private final ChatMemoryStore chatMemoryStore;
@@ -38,8 +38,8 @@ public class TalentService {
     private TalentAnalyst analyst;
     private StreamingTalentAnalyst streamingAnalyst;
 
-    public TalentService(ChatLanguageModel chatLanguageModel,
-                         StreamingChatLanguageModel streamingChatLanguageModel,
+    public TalentService(ChatModel chatLanguageModel,
+                         StreamingChatModel streamingChatLanguageModel,
                          EmbeddingModel embeddingModel,
                          EmbeddingStore<TextSegment> embeddingStore,
                          ChatMemoryStore chatMemoryStore,
@@ -73,7 +73,7 @@ public class TalentService {
                 .build();
 
         this.analyst = AiServices.builder(TalentAnalyst.class)
-                .chatLanguageModel(chatLanguageModel)
+                .chatModel(chatLanguageModel)
                 .chatMemoryProvider(memoryId -> MessageWindowChatMemory.builder()
                         .id(memoryId)
                         .maxMessages(10)
@@ -84,7 +84,7 @@ public class TalentService {
                 .build();
 
         this.streamingAnalyst = AiServices.builder(StreamingTalentAnalyst.class)
-                .streamingChatLanguageModel(streamingChatLanguageModel)
+                .streamingChatModel(streamingChatLanguageModel)
                 .chatMemoryProvider(memoryId -> MessageWindowChatMemory.builder()
                         .id(memoryId)
                         .maxMessages(10)

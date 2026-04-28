@@ -83,6 +83,7 @@ src/
           project/
             ai_project/
               AiProjectApplicationTests.java
+              DocumentLoaderParentChildDebugTest.java
               TalentServiceTest.java
 .gitattributes
 .gitignore
@@ -95,262 +96,6 @@ README.md
 
 <files>
 This section contains the contents of the repository's files.
-
-<file path="src/main/java/com/ai/project/ai_project/controller/DocumentController.java">
-package com.ai.project.ai_project.controller;
-
-import com.ai.project.ai_project.service.DocumentLoader;
-import org.springframework.http.MediaType;
-import org.springframework.web.bind.annotation.CrossOrigin;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RequestPart;
-import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.multipart.MultipartFile;
-import org.springframework.web.server.ResponseStatusException;
-
-import java.io.IOException;
-
-import static org.springframework.http.HttpStatus.BAD_REQUEST;
-import static org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR;
-
-@RestController
-@RequestMapping("/api/documents")
-@CrossOrigin(origins = "http://localhost:5173")
-public class DocumentController {
-
-    private final DocumentLoader documentLoader;
-
-    public DocumentController(DocumentLoader documentLoader) {
-        this.documentLoader = documentLoader;
-    }
-
-    @PostMapping(value = "/upload-resume", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public DocumentLoader.UploadResult uploadResume(@RequestParam(defaultValue = "default-user") String userId,
-                                                    @RequestPart("file") MultipartFile file) {
-        try {
-            return documentLoader.loadResume(userId, file);
-        } catch (IllegalArgumentException e) {
-            throw new ResponseStatusException(BAD_REQUEST, e.getMessage(), e);
-        } catch (IOException e) {
-            throw new ResponseStatusException(INTERNAL_SERVER_ERROR, "解析简历失败", e);
-        }
-    }
-
-    @GetMapping("/query-resume")
-    public String queryResume(@RequestParam(defaultValue = "default-user") String userId,
-                              @RequestParam String query) {
-        try {
-            return documentLoader.queryResume(userId, query);
-        } catch (IllegalArgumentException e) {
-            throw new ResponseStatusException(BAD_REQUEST, e.getMessage(), e);
-        }
-    }
-}
-</file>
-
-<file path="src/main/java/com/ai/project/ai_project/service/DocumentLoader.java">
-package com.ai.project.ai_project.service;
-
-import dev.langchain4j.data.document.Document;
-import dev.langchain4j.data.document.DocumentSplitter;
-import dev.langchain4j.data.document.Metadata;
-import dev.langchain4j.data.document.parser.apache.tika.ApacheTikaDocumentParser;
-import dev.langchain4j.data.document.splitter.DocumentSplitters;
-import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.model.chat.ChatLanguageModel;
-import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.rag.query.Query;
-import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
-import dev.langchain4j.service.AiServices;
-import dev.langchain4j.service.SystemMessage;
-import dev.langchain4j.service.UserMessage;
-import dev.langchain4j.store.embedding.EmbeddingStore;
-import dev.langchain4j.store.embedding.EmbeddingStoreIngestor;
-import dev.langchain4j.store.embedding.IngestionResult;
-import dev.langchain4j.store.embedding.filter.Filter;
-import dev.langchain4j.store.embedding.filter.logical.And;
-import org.springframework.stereotype.Service;
-import org.springframework.web.multipart.MultipartFile;
-
-import java.io.IOException;
-import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
-import java.time.Instant;
-import java.util.Locale;
-import java.util.Set;
-
-import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
-
-@Service
-public class DocumentLoader {
-
-    private static final Set<String> SUPPORTED_EXTENSIONS = Set.of("pdf", "doc", "docx");
-
-    private final ChatLanguageModel chatLanguageModel;
-    private final EmbeddingModel embeddingModel;
-    private final EmbeddingStore<TextSegment> embeddingStore;
-    private final ApacheTikaDocumentParser parser;
-    private final DocumentSplitter splitter;
-
-    public DocumentLoader(ChatLanguageModel chatLanguageModel,
-                          EmbeddingModel embeddingModel,
-                          EmbeddingStore<TextSegment> embeddingStore) {
-        this.chatLanguageModel = chatLanguageModel;
-        this.embeddingModel = embeddingModel;
-        this.embeddingStore = embeddingStore;
-        this.parser = new ApacheTikaDocumentParser();
-        this.splitter = DocumentSplitters.recursive(500, 100);
-    }
-
-    public UploadResult loadResume(String userId, MultipartFile file) throws IOException {
-        if (file == null || file.isEmpty()) {
-            throw new IllegalArgumentException("上传文件不能为空");
-        }
-
-        String normalizedUserId = normalizeUserId(userId);
-
-        String fileName = file.getOriginalFilename();
-        validateExtension(fileName);
-
-        Document parsedDocument;
-        try (InputStream inputStream = file.getInputStream()) {
-            parsedDocument = parser.parse(inputStream);
-        }
-
-        String text = parsedDocument.text();
-        if (text == null || text.isBlank()) {
-            throw new IllegalArgumentException("文档内容为空，无法入库");
-        }
-
-        Metadata metadata = parsedDocument.metadata() == null
-                ? new Metadata()
-                : parsedDocument.metadata().copy();
-        metadata.put("userId", normalizedUserId);
-        metadata.put("userIdKey", toHexKey(normalizedUserId));
-        metadata.put("sourceType", "resume");
-        metadata.put("fileName", fileName == null ? "" : fileName);
-        metadata.put("contentType", file.getContentType() == null ? "" : file.getContentType());
-        metadata.put("uploadedAt", Instant.now().toString());
-
-        Document enrichedDocument = Document.from(text, metadata);
-        int segmentCount = splitter.split(enrichedDocument).size();
-
-        EmbeddingStoreIngestor ingestor = EmbeddingStoreIngestor.builder()
-                .embeddingModel(embeddingModel)
-                .embeddingStore(embeddingStore)
-                .documentSplitter(splitter)
-                .build();
-
-        IngestionResult ingestionResult = ingestor.ingest(enrichedDocument);
-
-        return new UploadResult(
-                normalizedUserId,
-                fileName == null ? "" : fileName,
-                segmentCount,
-                text.length(),
-                ingestionResult.tokenUsage() == null ? null : ingestionResult.tokenUsage().totalTokenCount()
-        );
-    }
-
-    private void validateExtension(String fileName) {
-        if (fileName == null || !fileName.contains(".")) {
-            throw new IllegalArgumentException("文件名无效，仅支持 PDF/DOC/DOCX");
-        }
-        String extension = fileName.substring(fileName.lastIndexOf('.') + 1).toLowerCase(Locale.ROOT);
-        if (!SUPPORTED_EXTENSIONS.contains(extension)) {
-            throw new IllegalArgumentException("仅支持上传 PDF、DOC、DOCX 格式");
-        }
-    }
-
-    public String queryResume(String userId, String query) {
-        if (query == null || query.isBlank()) {
-            throw new IllegalArgumentException("query 不能为空");
-        }
-        if (userId == null || userId.isBlank()) {
-            throw new IllegalArgumentException("userId 不能为空");
-        }
-
-        String normalizedUserId = normalizeUserId(userId);
-
-        Filter filter = new And(
-                metadataKey("userIdKey").isEqualTo(toHexKey(normalizedUserId)),
-                metadataKey("sourceType").isEqualTo("resume")
-        );
-
-        EmbeddingStoreContentRetriever retriever = EmbeddingStoreContentRetriever.builder()
-                .embeddingStore(embeddingStore)
-                .embeddingModel(embeddingModel)
-                .maxResults(5)
-                .minScore(0.0)
-                .filter(filter)
-                .build();
-
-        if (retriever.retrieve(Query.from(query)).isEmpty()) {
-            return "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
-        }
-
-        ResumeQaAssistant assistant = AiServices.builder(ResumeQaAssistant.class)
-                .chatLanguageModel(chatLanguageModel)
-                .contentRetriever(retriever)
-                .build();
-
-        return assistant.answer(query);
-    }
-
-    interface ResumeQaAssistant {
-        @SystemMessage("""
-                你是一个简历分析助手。
-                请仅基于检索到的简历内容回答问题，不要编造。
-                如果简历中没有相关信息，请明确回答：未在该用户简历中找到相关信息。
-                """)
-        String answer(@UserMessage String question);
-    }
-
-    private String toHexKey(String raw) {
-        String value = raw == null ? "" : raw;
-        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
-        StringBuilder sb = new StringBuilder(bytes.length * 2);
-        for (byte b : bytes) {
-            sb.append(String.format("%02x", b));
-        }
-        return sb.toString();
-    }
-
-    private String normalizeUserId(String userId) {
-        if (userId == null || userId.isBlank()) {
-            return "default-user";
-        }
-        return userId.trim();
-    }
-
-    public record UploadResult(
-            String userId,
-            String fileName,
-            int segmentCount,
-            int characterCount,
-            Integer embeddingTokenCount
-    ) {
-    }
-}
-</file>
-
-<file path="src/main/resources/sql/chat_memory_category_migration.sql">
--- Run this once on MySQL before deploying category-based chat memory storage.
--- It upgrades chat_memory from (id, messages) to (id, category, messages).
-
-ALTER TABLE chat_memory
-    ADD COLUMN category VARCHAR(64) NOT NULL DEFAULT 'default' AFTER id;
-
--- Rebuild primary key to allow the same id under different module categories.
-ALTER TABLE chat_memory
-    DROP PRIMARY KEY,
-    ADD PRIMARY KEY (id, category);
-
-CREATE INDEX idx_chat_memory_category ON chat_memory (category);
-</file>
 
 <file path=".mvn/wrapper/maven-wrapper.properties">
 wrapperVersion=3.3.4
@@ -436,154 +181,19 @@ public final class ModelConfig {
 }
 </file>
 
-<file path="src/main/java/com/ai/project/ai_project/domain/ChatMemoryEntity.java">
-package com.ai.project.ai_project.domain;
+<file path="src/main/resources/sql/chat_memory_category_migration.sql">
+-- Run this once on MySQL before deploying category-based chat memory storage.
+-- It upgrades chat_memory from (id, messages) to (id, category, messages).
 
-import com.baomidou.mybatisplus.annotation.TableId;
-import com.baomidou.mybatisplus.annotation.TableField;
-import com.baomidou.mybatisplus.annotation.TableName;
+ALTER TABLE chat_memory
+    ADD COLUMN category VARCHAR(64) NOT NULL DEFAULT 'default' AFTER id;
 
-@TableName("chat_memory")
-public class ChatMemoryEntity {
+-- Rebuild primary key to allow the same id under different module categories.
+ALTER TABLE chat_memory
+    DROP PRIMARY KEY,
+    ADD PRIMARY KEY (id, category);
 
-    @TableId
-    private String id;
-    @TableField("category")
-    private String category;
-    private String messages;
-
-    public ChatMemoryEntity() {
-    }
-
-    public ChatMemoryEntity(String id, String category, String messages) {
-        this.id = id;
-        this.category = category;
-        this.messages = messages;
-    }
-
-    public String getId() {
-        return id;
-    }
-
-    public void setId(String id) {
-        this.id = id;
-    }
-
-    public String getMessages() {
-        return messages;
-    }
-
-    public void setMessages(String messages) {
-        this.messages = messages;
-    }
-
-    public String getCategory() {
-        return category;
-    }
-
-    public void setCategory(String category) {
-        this.category = category;
-    }
-}
-</file>
-
-<file path="src/main/java/com/ai/project/ai_project/event/ChatMemoryPersistEvent.java">
-package com.ai.project.ai_project.event;
-
-public class ChatMemoryPersistEvent {
-
-    private final String memoryId;
-    private final String category;
-    private final String messagesJson;
-    private final boolean delete;
-
-    public ChatMemoryPersistEvent(String memoryId, String category, String messagesJson, boolean delete) {
-        this.memoryId = memoryId;
-        this.category = category;
-        this.messagesJson = messagesJson;
-        this.delete = delete;
-    }
-
-    public String getMemoryId() {
-        return memoryId;
-    }
-
-    public String getMessagesJson() {
-        return messagesJson;
-    }
-
-    public String getCategory() {
-        return category;
-    }
-
-    public boolean isDelete() {
-        return delete;
-    }
-}
-</file>
-
-<file path="src/main/java/com/ai/project/ai_project/listener/ChatMemoryPersistListener.java">
-package com.ai.project.ai_project.listener;
-
-import com.ai.project.ai_project.domain.ChatMemoryEntity;
-import com.ai.project.ai_project.event.ChatMemoryPersistEvent;
-import com.ai.project.ai_project.mapper.ChatMemoryMapper;
-import org.springframework.context.event.EventListener;
-import org.springframework.scheduling.annotation.Async;
-import org.springframework.stereotype.Component;
-
-@Component
-public class ChatMemoryPersistListener {
-
-    private final ChatMemoryMapper mapper;
-
-    public ChatMemoryPersistListener(ChatMemoryMapper mapper) {
-        this.mapper = mapper;
-    }
-
-    @Async
-    @EventListener
-    public void onChatMemoryPersistEvent(ChatMemoryPersistEvent event) {
-        if (event.isDelete()) {
-            mapper.deleteByIdAndCategory(event.getMemoryId(), event.getCategory());
-            return;
-        }
-
-        ChatMemoryEntity entity = new ChatMemoryEntity(event.getMemoryId(), event.getCategory(), event.getMessagesJson());
-        if (mapper.selectByIdAndCategory(entity.getId(), entity.getCategory()) == null) {
-            mapper.insert(entity);
-        } else {
-            mapper.updateMessagesByIdAndCategory(entity.getId(), entity.getCategory(), entity.getMessages());
-        }
-    }
-}
-</file>
-
-<file path="src/main/java/com/ai/project/ai_project/mapper/ChatMemoryMapper.java">
-package com.ai.project.ai_project.mapper;
-
-import com.ai.project.ai_project.domain.ChatMemoryEntity;
-import com.baomidou.mybatisplus.core.mapper.BaseMapper;
-import org.apache.ibatis.annotations.Mapper;
-import org.apache.ibatis.annotations.Param;
-import org.apache.ibatis.annotations.Select;
-import org.apache.ibatis.annotations.Delete;
-import org.apache.ibatis.annotations.Update;
-
-@Mapper
-public interface ChatMemoryMapper extends BaseMapper<ChatMemoryEntity> {
-
-    @Select("SELECT id, category, messages FROM chat_memory WHERE id = #{id} AND category = #{category} LIMIT 1")
-    ChatMemoryEntity selectByIdAndCategory(@Param("id") String id, @Param("category") String category);
-
-    @Delete("DELETE FROM chat_memory WHERE id = #{id} AND category = #{category}")
-    int deleteByIdAndCategory(@Param("id") String id, @Param("category") String category);
-
-    @Update("UPDATE chat_memory SET messages = #{messages} WHERE id = #{id} AND category = #{category}")
-    int updateMessagesByIdAndCategory(@Param("id") String id,
-                                      @Param("category") String category,
-                                      @Param("messages") String messages);
-}
+CREATE INDEX idx_chat_memory_category ON chat_memory (category);
 </file>
 
 <file path="src/test/java/com/ai/project/ai_project/AiProjectApplicationTests.java">
@@ -599,6 +209,100 @@ class AiProjectApplicationTests {
     void contextLoads() {
     }
 
+}
+</file>
+
+<file path="src/test/java/com/ai/project/ai_project/DocumentLoaderParentChildDebugTest.java">
+package com.ai.project.ai_project;
+
+import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
+import dev.langchain4j.store.embedding.EmbeddingStore;
+import dev.langchain4j.store.embedding.filter.Filter;
+import dev.langchain4j.store.embedding.filter.logical.And;
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+
+import java.nio.charset.StandardCharsets;
+
+import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
+
+@SpringBootTest
+@Disabled("手动调试父子检索时启用")
+class DocumentLoaderParentChildDebugTest {
+
+    @Autowired(required = false)
+    private EmbeddingStore<TextSegment> embeddingStore;
+
+    @Autowired(required = false)
+    private EmbeddingModel embeddingModel;
+
+    @Test
+    void debugParentChildRetrieve() {
+        if (embeddingStore == null || embeddingModel == null) {
+            System.out.println("EmbeddingStore 或 EmbeddingModel 未注入，请先确认应用配置可启动");
+            return;
+        }
+
+        String userId = "default";
+        String query = "候选人的技术栈有哪些";
+        int topK = 5;
+
+        Filter filter = new And(
+                metadataKey("userIdKey").isEqualTo(toHexKey(userId)),
+                metadataKey("sourceType").isEqualTo("resume")
+        );
+
+        EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
+                .queryEmbedding(embeddingModel.embed(query).content())
+                .maxResults(topK)
+                .minScore(0.0)
+                .filter(filter)
+                .build();
+
+        var result = embeddingStore.search(request);
+        System.out.println("命中条数: " + result.matches().size());
+
+        for (int i = 0; i < result.matches().size(); i++) {
+            var match = result.matches().get(i);
+            var segment = match.embedded();
+            var metadata = segment == null ? null : segment.metadata();
+            String childText = segment == null ? "" : abbreviate(segment.text(), 180);
+            String parentType = metadata == null ? "" : metadata.getString("parentType");
+            String parentIndex = metadata == null ? "" : metadata.getString("parentIndex");
+            String childIndex = metadata == null ? "" : metadata.getString("childIndex");
+            String parentBlock = metadata == null ? "" : abbreviate(metadata.getString("parentBlock"), 260);
+
+            System.out.println("\n== Hit " + (i + 1) + " ==");
+            System.out.println("score=" + match.score());
+            System.out.println("parentType=" + parentType + ", parentIndex=" + parentIndex + ", childIndex=" + childIndex);
+            System.out.println("childText=" + childText);
+            System.out.println("parentBlock=" + parentBlock);
+        }
+    }
+
+    private String toHexKey(String raw) {
+        byte[] bytes = raw.getBytes(StandardCharsets.UTF_8);
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(String.format("%02x", b));
+        }
+        return sb.toString();
+    }
+
+    private String abbreviate(String text, int maxLen) {
+        if (text == null || text.isBlank()) {
+            return "";
+        }
+        String normalized = text.replaceAll("\\s+", " ").trim();
+        if (normalized.length() <= maxLen) {
+            return normalized;
+        }
+        return normalized.substring(0, maxLen) + "...";
+    }
 }
 </file>
 
@@ -1147,6 +851,62 @@ public class MybatisConfig {
 }
 </file>
 
+<file path="src/main/java/com/ai/project/ai_project/controller/DocumentController.java">
+package com.ai.project.ai_project.controller;
+
+import com.ai.project.ai_project.service.DocumentLoader;
+import org.springframework.http.MediaType;
+import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RequestPart;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.server.ResponseStatusException;
+
+import java.io.IOException;
+
+import static org.springframework.http.HttpStatus.BAD_REQUEST;
+import static org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR;
+
+@RestController
+@RequestMapping("/api/documents")
+@CrossOrigin(origins = "http://localhost:5173")
+public class DocumentController {
+
+    private final DocumentLoader documentLoader;
+
+    public DocumentController(DocumentLoader documentLoader) {
+        this.documentLoader = documentLoader;
+    }
+
+    @PostMapping(value = "/upload-resume", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public DocumentLoader.UploadResult uploadResume(@RequestParam(defaultValue = "default-user") String userId,
+                                                    @RequestPart("file") MultipartFile file) {
+        try {
+            return documentLoader.loadResume(userId, file);
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(BAD_REQUEST, e.getMessage(), e);
+        } catch (IOException e) {
+            throw new ResponseStatusException(INTERNAL_SERVER_ERROR, "解析简历失败", e);
+        }
+    }
+
+    @GetMapping("/query-resume")
+    public String queryResume(@RequestParam(defaultValue = "default-user") String userId,
+                              @RequestParam String query) {
+        try {
+            return documentLoader.queryResume(userId, query);
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(BAD_REQUEST, e.getMessage(), e);
+        }
+    }
+
+}
+</file>
+
 <file path="src/main/java/com/ai/project/ai_project/controller/TalentController.java">
 package com.ai.project.ai_project.controller;
 
@@ -1209,140 +969,463 @@ public class TalentController {
 }
 </file>
 
-<file path="src/main/java/com/ai/project/ai_project/service/TalentService.java">
-package com.ai.project.ai_project.service;
+<file path="src/main/java/com/ai/project/ai_project/domain/ChatMemoryEntity.java">
+package com.ai.project.ai_project.domain;
 
-import com.ai.project.ai_project.tools.FinancialTools;
-import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.memory.chat.MessageWindowChatMemory;
-import dev.langchain4j.model.chat.ChatLanguageModel;
-import dev.langchain4j.model.chat.StreamingChatLanguageModel;
-import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
-import dev.langchain4j.service.AiServices;
-import dev.langchain4j.service.MemoryId;
-import dev.langchain4j.service.SystemMessage;
-import dev.langchain4j.service.TokenStream;
-import dev.langchain4j.service.UserMessage;
-import dev.langchain4j.store.embedding.EmbeddingStore;
-import dev.langchain4j.store.memory.chat.ChatMemoryStore;
-import jakarta.annotation.PostConstruct;
-import org.springframework.stereotype.Service;
+import com.baomidou.mybatisplus.annotation.TableId;
+import com.baomidou.mybatisplus.annotation.TableField;
+import com.baomidou.mybatisplus.annotation.TableName;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
+@TableName("chat_memory")
+public class ChatMemoryEntity {
 
-@Service
-public class TalentService {
-    private static final String MEMORY_CATEGORY = "talent";
-    private static final String MEMORY_SCOPE_SEPARATOR = "::";
+    @TableId
+    private String id;
+    @TableField("category")
+    private String category;
+    private String messages;
 
-    private final ChatLanguageModel chatLanguageModel;
-    private final StreamingChatLanguageModel streamingChatLanguageModel;
-    private final EmbeddingModel embeddingModel;
-    private final EmbeddingStore<TextSegment> embeddingStore;
-    private final ChatMemoryStore chatMemoryStore;
-    private final FinancialTools financialTools;
-
-    private TalentAnalyst analyst;
-    private StreamingTalentAnalyst streamingAnalyst;
-
-    public TalentService(ChatLanguageModel chatLanguageModel,
-                         StreamingChatLanguageModel streamingChatLanguageModel,
-                         EmbeddingModel embeddingModel,
-                         EmbeddingStore<TextSegment> embeddingStore,
-                         ChatMemoryStore chatMemoryStore,
-                         FinancialTools financialTools) {
-        this.chatLanguageModel = chatLanguageModel;
-        this.streamingChatLanguageModel = streamingChatLanguageModel;
-        this.embeddingModel = embeddingModel;
-        this.embeddingStore = embeddingStore;
-        this.chatMemoryStore = chatMemoryStore;
-        this.financialTools = financialTools;
+    public ChatMemoryEntity() {
     }
 
-    @PostConstruct
-    public void init() throws IOException {
-        // Load data into vector store
-        Path csvPath = Path.of("/Users/winter/Downloads/test_users.csv");
-        if (Files.exists(csvPath)) {
-            List<String> lines = Files.readAllLines(csvPath);
-            for (int i = 1; i < lines.size(); i++) {
-                String line = lines.get(i).trim();
-                if (!line.isEmpty()) {
-                    TextSegment segment = TextSegment.from(line);
-                    embeddingStore.add(embeddingModel.embed(segment).content(), segment);
+    public ChatMemoryEntity(String id, String category, String messages) {
+        this.id = id;
+        this.category = category;
+        this.messages = messages;
+    }
+
+    public String getId() {
+        return id;
+    }
+
+    public void setId(String id) {
+        this.id = id;
+    }
+
+    public String getMessages() {
+        return messages;
+    }
+
+    public void setMessages(String messages) {
+        this.messages = messages;
+    }
+
+    public String getCategory() {
+        return category;
+    }
+
+    public void setCategory(String category) {
+        this.category = category;
+    }
+}
+</file>
+
+<file path="src/main/java/com/ai/project/ai_project/event/ChatMemoryPersistEvent.java">
+package com.ai.project.ai_project.event;
+
+public class ChatMemoryPersistEvent {
+
+    private final String memoryId;
+    private final String category;
+    private final String messagesJson;
+    private final boolean delete;
+
+    public ChatMemoryPersistEvent(String memoryId, String category, String messagesJson, boolean delete) {
+        this.memoryId = memoryId;
+        this.category = category;
+        this.messagesJson = messagesJson;
+        this.delete = delete;
+    }
+
+    public String getMemoryId() {
+        return memoryId;
+    }
+
+    public String getMessagesJson() {
+        return messagesJson;
+    }
+
+    public String getCategory() {
+        return category;
+    }
+
+    public boolean isDelete() {
+        return delete;
+    }
+}
+</file>
+
+<file path="src/main/java/com/ai/project/ai_project/listener/ChatMemoryPersistListener.java">
+package com.ai.project.ai_project.listener;
+
+import com.ai.project.ai_project.domain.ChatMemoryEntity;
+import com.ai.project.ai_project.event.ChatMemoryPersistEvent;
+import com.ai.project.ai_project.mapper.ChatMemoryMapper;
+import org.springframework.context.event.EventListener;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Component;
+
+@Component
+public class ChatMemoryPersistListener {
+
+    private final ChatMemoryMapper mapper;
+
+    public ChatMemoryPersistListener(ChatMemoryMapper mapper) {
+        this.mapper = mapper;
+    }
+
+    @Async
+    @EventListener
+    public void onChatMemoryPersistEvent(ChatMemoryPersistEvent event) {
+        if (event.isDelete()) {
+            mapper.deleteByIdAndCategory(event.getMemoryId(), event.getCategory());
+            return;
+        }
+
+        ChatMemoryEntity entity = new ChatMemoryEntity(event.getMemoryId(), event.getCategory(), event.getMessagesJson());
+        if (mapper.selectByIdAndCategory(entity.getId(), entity.getCategory()) == null) {
+            mapper.insert(entity);
+        } else {
+            mapper.updateMessagesByIdAndCategory(entity.getId(), entity.getCategory(), entity.getMessages());
+        }
+    }
+}
+</file>
+
+<file path="src/main/java/com/ai/project/ai_project/mapper/ChatMemoryMapper.java">
+package com.ai.project.ai_project.mapper;
+
+import com.ai.project.ai_project.domain.ChatMemoryEntity;
+import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+import org.apache.ibatis.annotations.Mapper;
+import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Select;
+import org.apache.ibatis.annotations.Delete;
+import org.apache.ibatis.annotations.Update;
+
+@Mapper
+public interface ChatMemoryMapper extends BaseMapper<ChatMemoryEntity> {
+
+    @Select("SELECT id, category, messages FROM chat_memory WHERE id = #{id} AND category = #{category} LIMIT 1")
+    ChatMemoryEntity selectByIdAndCategory(@Param("id") String id, @Param("category") String category);
+
+    @Delete("DELETE FROM chat_memory WHERE id = #{id} AND category = #{category}")
+    int deleteByIdAndCategory(@Param("id") String id, @Param("category") String category);
+
+    @Update("UPDATE chat_memory SET messages = #{messages} WHERE id = #{id} AND category = #{category}")
+    int updateMessagesByIdAndCategory(@Param("id") String id,
+                                      @Param("category") String category,
+                                      @Param("messages") String messages);
+}
+</file>
+
+<file path="src/main/java/com/ai/project/ai_project/service/DocumentLoader.java">
+package com.ai.project.ai_project.service;
+
+import dev.langchain4j.data.document.Document;
+import dev.langchain4j.data.document.DocumentSplitter;
+import dev.langchain4j.data.document.Metadata;
+import dev.langchain4j.data.document.parser.apache.tika.ApacheTikaDocumentParser;
+import dev.langchain4j.data.document.splitter.DocumentSplitters;
+import dev.langchain4j.data.embedding.Embedding;
+import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.model.output.Response;
+import dev.langchain4j.rag.query.Query;
+import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
+import dev.langchain4j.service.AiServices;
+import dev.langchain4j.service.SystemMessage;
+import dev.langchain4j.service.UserMessage;
+import dev.langchain4j.store.embedding.EmbeddingStore;
+import dev.langchain4j.store.embedding.filter.Filter;
+import dev.langchain4j.store.embedding.filter.logical.And;
+import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.regex.Pattern;
+
+import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
+
+@Service
+public class DocumentLoader {
+
+    private static final Set<String> SUPPORTED_EXTENSIONS = Set.of("pdf", "doc", "docx");
+    private static final String SOURCE_TYPE_RESUME = "resume";
+    private static final DocumentSplitter CHILD_SPLITTER = DocumentSplitters.recursive(200, 40);
+    private static final Pattern PROJECT_SECTION_HEADER = Pattern.compile(
+            "^(项目经历|项目经验|项目背景)(\\s*[A-Za-z0-9一二三四五六七八九十]+)?\\s*[:：]?$"
+    );
+    private static final Pattern GENERIC_SECTION_HEADER = Pattern.compile(
+            "^(基本信息|个人信息|联系方式|教育经历|工作经历|实习经历|项目经历|项目经验|专业技能|技能栈|技术栈|证书|获奖情况|自我评价|个人评价|个人总结)(\\s*[A-Za-z0-9一二三四五六七八九十]+)?\\s*[:：]?$"
+    );
+    private static final Pattern DATE_RANGE_PATTERN = Pattern.compile(
+            "(19|20)\\d{2}[./-]\\d{1,2}\\s*[-~到至]\\s*((19|20)\\d{2}[./-]\\d{1,2}|至今|现在)"
+    );
+
+    private final ChatLanguageModel chatLanguageModel;
+    private final EmbeddingModel embeddingModel;
+    private final EmbeddingStore<TextSegment> embeddingStore;
+    private final ApacheTikaDocumentParser parser;
+
+    public DocumentLoader(ChatLanguageModel chatLanguageModel,
+                          EmbeddingModel embeddingModel,
+                          EmbeddingStore<TextSegment> embeddingStore) {
+        this.chatLanguageModel = chatLanguageModel;
+        this.embeddingModel = embeddingModel;
+        this.embeddingStore = embeddingStore;
+        this.parser = new ApacheTikaDocumentParser();
+    }
+
+    public UploadResult loadResume(String userId, MultipartFile file) throws IOException {
+        if (file == null || file.isEmpty()) {
+            throw new IllegalArgumentException("上传文件不能为空");
+        }
+
+        String normalizedUserId = normalizeUserId(userId);
+
+        String fileName = file.getOriginalFilename();
+        validateExtension(fileName);
+
+        Document parsedDocument;
+        try (InputStream inputStream = file.getInputStream()) {
+            parsedDocument = parser.parse(inputStream);
+        }
+
+        String text = parsedDocument.text();
+        if (text == null || text.isBlank()) {
+            throw new IllegalArgumentException("文档内容为空，无法入库");
+        }
+
+        Metadata metadata = parsedDocument.metadata() == null
+                ? new Metadata()
+                : parsedDocument.metadata().copy();
+        metadata.put("userId", normalizedUserId);
+        metadata.put("userIdKey", toHexKey(normalizedUserId));
+        metadata.put("sourceType", SOURCE_TYPE_RESUME);
+        metadata.put("fileName", fileName == null ? "" : fileName);
+        metadata.put("contentType", file.getContentType() == null ? "" : file.getContentType());
+        metadata.put("uploadedAt", Instant.now().toString());
+
+        String normalizedText = normalizeText(text);
+        //拆分文档内容
+        List<ParentBlock> parentBlocks = extractParentBlocks(normalizedText);
+        if (parentBlocks.isEmpty()) {
+            parentBlocks = List.of(new ParentBlock("resume", normalizedText));
+        }
+
+        List<TextSegment> childSegments = new ArrayList<>();
+        for (int i = 0; i < parentBlocks.size(); i++) {
+            ParentBlock parentBlock = parentBlocks.get(i);
+            Metadata parentMetadata = metadata.copy();
+            parentMetadata.put("parentType", parentBlock.type());
+            parentMetadata.put("parentIndex", String.valueOf(i));
+            parentMetadata.put("parentBlock", parentBlock.content());
+
+            Document parentDocument = Document.from(parentBlock.content(), parentMetadata);
+            List<TextSegment> children = CHILD_SPLITTER.split(parentDocument);
+            for (int childIndex = 0; childIndex < children.size(); childIndex++) {
+                TextSegment child = children.get(childIndex);
+                if (child.text() == null || child.text().isBlank()) {
+                    continue;
                 }
+                Metadata childMetadata = child.metadata() == null ? new Metadata() : child.metadata().copy();
+                childMetadata.put("childIndex", String.valueOf(childIndex));
+                childSegments.add(TextSegment.from(child.text().trim(), childMetadata));
             }
         }
+
+        if (childSegments.isEmpty()) {
+            throw new IllegalArgumentException("文档分片为空，无法入库");
+        }
+
+        Response<List<Embedding>> response = embeddingModel.embedAll(childSegments);
+        embeddingStore.addAll(response.content(), childSegments);
+
+        return new UploadResult(
+                normalizedUserId,
+                fileName == null ? "" : fileName,
+                childSegments.size(),
+                text.length(),
+                response.tokenUsage() == null ? null : response.tokenUsage().totalTokenCount()
+        );
+    }
+
+    private String normalizeText(String text) {
+        return text.replace("\r\n", "\n").replace('\r', '\n').replaceAll("\n{3,}", "\n\n").trim();
+    }
+
+    private List<ParentBlock> extractParentBlocks(String text) {
+        List<ParentBlock> blocks = new ArrayList<>();
+        String[] lines = text.split("\n");
+
+        String currentType = "resume";
+        StringBuilder current = new StringBuilder();
+        for (String line : lines) {
+            String trimmed = line == null ? "" : line.trim();
+            if (trimmed.isBlank()) {
+                if (!current.isEmpty()) {
+                    current.append('\n');
+                }
+                continue;
+            }
+
+            if (isSectionHeader(trimmed)) {
+                appendBlock(blocks, currentType, current);
+                current = new StringBuilder();
+                currentType = PROJECT_SECTION_HEADER.matcher(trimmed).matches() ? "project" : "resume";
+                current.append(trimmed);
+                continue;
+            }
+
+            if (!current.isEmpty()) {
+                current.append('\n');
+            }
+            current.append(trimmed);
+        }
+
+        appendBlock(blocks, currentType, current);
+        return blocks;
+    }
+
+    private boolean isSectionHeader(String line) {
+        if (line.length() > 50) {
+            return false;
+        }
+        return GENERIC_SECTION_HEADER.matcher(line).matches();
+    }
+
+    private void appendBlock(List<ParentBlock> blocks, String type, StringBuilder content) {
+        String value = content.toString().trim();
+        if (!value.isBlank()) {
+            String resolvedType = resolveParentType(type, value);
+            blocks.add(new ParentBlock(resolvedType, value));
+        }
+    }
+
+    private String resolveParentType(String headerType, String content) {
+        if ("project".equals(headerType)) {
+            return "project";
+        }
+        if (looksLikeProjectContent(content)) {
+            return "project";
+        }
+        return "resume";
+    }
+
+    private boolean looksLikeProjectContent(String content) {
+        if (content == null || content.isBlank()) {
+            return false;
+        }
+
+        boolean hasDateRange = DATE_RANGE_PATTERN.matcher(content).find();
+        boolean hasProjectNouns = containsAny(content, "项目", "系统", "平台", "业务", "架构");
+        boolean hasWorkSignals = containsAny(content, "负责", "主导", "实现", "优化", "设计", "技术方案", "性能");
+
+        return (hasDateRange && hasProjectNouns) || (hasProjectNouns && hasWorkSignals);
+    }
+
+    private boolean containsAny(String text, String... keywords) {
+        for (String keyword : keywords) {
+            if (text.contains(keyword)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void validateExtension(String fileName) {
+        if (fileName == null || !fileName.contains(".")) {
+            throw new IllegalArgumentException("文件名无效，仅支持 PDF/DOC/DOCX");
+        }
+        String extension = fileName.substring(fileName.lastIndexOf('.') + 1).toLowerCase(Locale.ROOT);
+        if (!SUPPORTED_EXTENSIONS.contains(extension)) {
+            throw new IllegalArgumentException("仅支持上传 PDF、DOC、DOCX 格式");
+        }
+    }
+
+    public String queryResume(String userId, String query) {
+        if (query == null || query.isBlank()) {
+            throw new IllegalArgumentException("query 不能为空");
+        }
+        if (userId == null || userId.isBlank()) {
+            throw new IllegalArgumentException("userId 不能为空");
+        }
+
+        String normalizedUserId = normalizeUserId(userId);
+
+        Filter filter = new And(
+                metadataKey("userIdKey").isEqualTo(toHexKey(normalizedUserId)),
+                metadataKey("sourceType").isEqualTo(SOURCE_TYPE_RESUME)
+        );
+
         EmbeddingStoreContentRetriever retriever = EmbeddingStoreContentRetriever.builder()
                 .embeddingStore(embeddingStore)
                 .embeddingModel(embeddingModel)
-                .maxResults(3)
+                .maxResults(5)
+                .minScore(0.0)
+                .filter(filter)
                 .build();
 
-        this.analyst = AiServices.builder(TalentAnalyst.class)
+        if (retriever.retrieve(Query.from(query)).isEmpty()) {
+            return "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
+        }
+
+        ResumeQaAssistant assistant = AiServices.builder(ResumeQaAssistant.class)
                 .chatLanguageModel(chatLanguageModel)
-                .chatMemoryProvider(memoryId -> MessageWindowChatMemory.builder()
-                        .id(memoryId)
-                        .maxMessages(10)
-                        .chatMemoryStore(chatMemoryStore)
-                        .build())
                 .contentRetriever(retriever)
-                .tools(financialTools)
                 .build();
 
-        this.streamingAnalyst = AiServices.builder(StreamingTalentAnalyst.class)
-                .streamingChatLanguageModel(streamingChatLanguageModel)
-                .chatMemoryProvider(memoryId -> MessageWindowChatMemory.builder()
-                        .id(memoryId)
-                        .maxMessages(10)
-                        .chatMemoryStore(chatMemoryStore)
-                        .build())
-                .contentRetriever(retriever)
-                .tools(financialTools)
-                .build();
+        return assistant.answer(query);
     }
 
-    public String analyze(String userId, String query) {
-        return analyst.analyze(scopedMemoryId(userId), query);
-    }
 
-    public TokenStream analyzeStream(String userId, String query) {
-        return streamingAnalyst.analyze(scopedMemoryId(userId), query);
-    }
-
-    private String scopedMemoryId(String userId) {
-        String safeUserId = (userId == null || userId.isBlank()) ? "default-user" : userId;
-        return MEMORY_CATEGORY + MEMORY_SCOPE_SEPARATOR + safeUserId;
-    }
-
-    public interface TalentAnalyst {
+    interface ResumeQaAssistant {
         @SystemMessage("""
-                你是一个高效的金融自动化助手。
-                你的任务流程如下：
-                1. 首先查询用户的余额。
-                2. 如果余额少于 50000 元（五万元），你必须【立即】且【自动】调用申请贷款的工具，无需询问用户。
-                3. 完成所有操作后，再一次性向用户汇报最终结果：余额是多少，以及是否已自动提交贷款申请。
-                请注意：不要在中途停下来问用户，直接执行完整流程。
+                你是一个简历分析助手。
+                请仅基于检索到的简历内容回答问题，不要编造。
+                如果简历中没有相关信息，请明确回答：未在该用户简历中找到相关信息。
                 """)
-        String analyze(@MemoryId String userId, @UserMessage String userQuery);
+        String answer(@UserMessage String question);
     }
 
-    public interface StreamingTalentAnalyst {
-        @SystemMessage("""
-                你是一个高效的金融自动化助手。
-                你的任务流程如下：
-                1. 首先查询用户的余额。
-                2. 如果余额少于 50000 元（五万元），你必须【立即】且【自动】调用申请贷款的工具，无需询问用户。
-                3. 完成所有操作后，再一次性向用户汇报最终结果：余额是多少，以及是否已自动提交贷款申请。
-                请注意：不要在中途停下来问用户，直接执行完整流程。
-                """)
-        TokenStream analyze(@MemoryId String userId, @UserMessage String userQuery);
+    private String toHexKey(String raw) {
+        String value = raw == null ? "" : raw;
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(String.format("%02x", b));
+        }
+        return sb.toString();
     }
+
+    private String normalizeUserId(String userId) {
+        if (userId == null || userId.isBlank()) {
+            return "default-user";
+        }
+        return userId.trim();
+    }
+
+    private record ParentBlock(String type, String content) {
+    }
+
+    public record UploadResult(
+            String userId,
+            String fileName,
+            int segmentCount,
+            int characterCount,
+            Integer embeddingTokenCount
+    ) {
+    }
+
 }
 </file>
 
@@ -1463,6 +1546,168 @@ build/
 .vscode/
 </file>
 
+<file path="src/main/java/com/ai/project/ai_project/service/TalentService.java">
+package com.ai.project.ai_project.service;
+
+import com.ai.project.ai_project.tools.FinancialTools;
+import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.memory.chat.MessageWindowChatMemory;
+import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.chat.StreamingChatLanguageModel;
+import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
+import dev.langchain4j.service.AiServices;
+import dev.langchain4j.service.MemoryId;
+import dev.langchain4j.service.SystemMessage;
+import dev.langchain4j.service.TokenStream;
+import dev.langchain4j.service.UserMessage;
+import dev.langchain4j.store.embedding.EmbeddingStore;
+import dev.langchain4j.store.memory.chat.ChatMemoryStore;
+import jakarta.annotation.PostConstruct;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+
+@Service
+public class TalentService {
+    private static final String MEMORY_CATEGORY = "talent";
+    private static final String MEMORY_SCOPE_SEPARATOR = "::";
+
+    private final ChatLanguageModel chatLanguageModel;
+    private final StreamingChatLanguageModel streamingChatLanguageModel;
+    private final EmbeddingModel embeddingModel;
+    private final EmbeddingStore<TextSegment> embeddingStore;
+    private final ChatMemoryStore chatMemoryStore;
+    private final FinancialTools financialTools;
+
+    private TalentAnalyst analyst;
+    private StreamingTalentAnalyst streamingAnalyst;
+
+    public TalentService(ChatLanguageModel chatLanguageModel,
+                         StreamingChatLanguageModel streamingChatLanguageModel,
+                         EmbeddingModel embeddingModel,
+                         EmbeddingStore<TextSegment> embeddingStore,
+                         ChatMemoryStore chatMemoryStore,
+                         FinancialTools financialTools) {
+        this.chatLanguageModel = chatLanguageModel;
+        this.streamingChatLanguageModel = streamingChatLanguageModel;
+        this.embeddingModel = embeddingModel;
+        this.embeddingStore = embeddingStore;
+        this.chatMemoryStore = chatMemoryStore;
+        this.financialTools = financialTools;
+    }
+
+    @PostConstruct
+    public void init() throws IOException {
+        // Load data into vector store
+//        Path csvPath = Path.of("/Users/winter/Downloads/test_users.csv");
+//        if (Files.exists(csvPath)) {
+//            List<String> lines = Files.readAllLines(csvPath);
+//            for (int i = 1; i < lines.size(); i++) {
+//                String line = lines.get(i).trim();
+//                if (!line.isEmpty()) {
+//                    TextSegment segment = TextSegment.from(line);
+//                    embeddingStore.add(embeddingModel.embed(segment).content(), segment);
+//                }
+//            }
+//        }
+        EmbeddingStoreContentRetriever retriever = EmbeddingStoreContentRetriever.builder()
+                .embeddingStore(embeddingStore)
+                .embeddingModel(embeddingModel)
+                .maxResults(3)
+                .build();
+
+        this.analyst = AiServices.builder(TalentAnalyst.class)
+                .chatLanguageModel(chatLanguageModel)
+                .chatMemoryProvider(memoryId -> MessageWindowChatMemory.builder()
+                        .id(memoryId)
+                        .maxMessages(10)
+                        .chatMemoryStore(chatMemoryStore)
+                        .build())
+                .contentRetriever(retriever)
+                .tools(financialTools)
+                .build();
+
+        this.streamingAnalyst = AiServices.builder(StreamingTalentAnalyst.class)
+                .streamingChatLanguageModel(streamingChatLanguageModel)
+                .chatMemoryProvider(memoryId -> MessageWindowChatMemory.builder()
+                        .id(memoryId)
+                        .maxMessages(10)
+                        .chatMemoryStore(chatMemoryStore)
+                        .build())
+                .contentRetriever(retriever)
+                .tools(financialTools)
+                .build();
+    }
+
+    public String analyze(String userId, String query) {
+        return analyst.analyze(scopedMemoryId(userId), query);
+    }
+
+    public TokenStream analyzeStream(String userId, String query) {
+        return streamingAnalyst.analyze(scopedMemoryId(userId), query);
+    }
+
+    private String scopedMemoryId(String userId) {
+        String safeUserId = (userId == null || userId.isBlank()) ? "default-user" : userId;
+        return MEMORY_CATEGORY + MEMORY_SCOPE_SEPARATOR + safeUserId;
+    }
+
+    public interface TalentAnalyst {
+        @SystemMessage("""
+                你是一个高效的金融自动化助手。
+                你的任务流程如下：
+                1. 首先查询用户的余额。
+                2. 如果余额少于 50000 元（五万元），你必须【立即】且【自动】调用申请贷款的工具，无需询问用户。
+                3. 完成所有操作后，再一次性向用户汇报最终结果：余额是多少，以及是否已自动提交贷款申请。
+                请注意：不要在中途停下来问用户，直接执行完整流程。
+                """)
+        String analyze(@MemoryId String userId, @UserMessage String userQuery);
+    }
+
+    public interface StreamingTalentAnalyst {
+        @SystemMessage("""
+                你是一个高效的金融自动化助手。
+                你的任务流程如下：
+                1. 首先查询用户的余额。
+                2. 如果余额少于 50000 元（五万元），你必须【立即】且【自动】调用申请贷款的工具，无需询问用户。
+                3. 完成所有操作后，再一次性向用户汇报最终结果：余额是多少，以及是否已自动提交贷款申请。
+                请注意：不要在中途停下来问用户，直接执行完整流程。
+                """)
+        TokenStream analyze(@MemoryId String userId, @UserMessage String userQuery);
+    }
+}
+</file>
+
+<file path="src/main/resources/application.properties">
+spring.application.name=ai_project
+spring.datasource.url=jdbc:mysql://localhost:3306/ai_project?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true
+spring.datasource.username=root
+spring.datasource.password=root
+spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
+
+# Redis (local deployment)
+spring.data.redis.host=localhost
+spring.data.redis.port=6379
+
+# Vector index with metadata filter fields (v2 avoids old incompatible schema)
+app.vector.index-name=talent-index-v2
+app.vector.prefix=talent:v2:
+
+# MyBatis-Plus Config
+mybatis-plus.type-aliases-package=com.ai.project.ai_project.domain
+mybatis-plus.global-config.db-config.id-type=auto
+
+# AI API Keys (from environment variables)
+GEMINI_AI_KEY=${GEMINI_AI_KEY}
+OPENAI_API_KEY=${OPENAI_API_KEY}
+DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+</file>
+
 <file path="src/main/java/com/ai/project/ai_project/config/LangChainConfig.java">
 package com.ai.project.ai_project.config;
 
@@ -1542,7 +1787,11 @@ public class LangChainConfig {
                         "userId",
                         "fileName",
                         "contentType",
-                        "uploadedAt"
+                        "uploadedAt",
+                        "parentType",
+                        "parentIndex",
+                        "parentBlock",
+                        "childIndex"
                 ))
                 .build();
     }
@@ -1602,31 +1851,6 @@ public class LangChainConfig {
         }
     }
 }
-</file>
-
-<file path="src/main/resources/application.properties">
-spring.application.name=ai_project
-spring.datasource.url=jdbc:mysql://localhost:3306/ai_project?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true
-spring.datasource.username=root
-spring.datasource.password=root
-spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
-
-# Redis (local deployment)
-spring.data.redis.host=localhost
-spring.data.redis.port=6379
-
-# Vector index with metadata filter fields (v2 avoids old incompatible schema)
-app.vector.index-name=talent-index-v2
-app.vector.prefix=talent:v2:
-
-# MyBatis-Plus Config
-mybatis-plus.type-aliases-package=com.ai.project.ai_project.domain
-mybatis-plus.global-config.db-config.id-type=auto
-
-# AI API Keys (from environment variables)
-GEMINI_AI_KEY=${GEMINI_AI_KEY}
-OPENAI_API_KEY=${OPENAI_API_KEY}
-DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
 </file>
 
 <file path="pom.xml">

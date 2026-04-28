@@ -5,13 +5,15 @@ import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
 import dev.langchain4j.model.ollama.OllamaChatModel;
 
+import java.util.Map;
+
 public final class ModelConfig {
 
     private static final String BASE_URL = "https://api-vip.codex-for.me/v1";
     private static final String MODEL_NAME = "gpt-5.2";
     private static final String OLLAMA_BASE_URL = "http://localhost:11434";
     private static final String OLLAMA_QWEN_MODEL_NAME = "qwen3.5:9b";
-    private static final String DEEPSEEK_API_MODEL_NAME = "deepseek-chat";
+    private static final String DEEPSEEK_API_MODEL_NAME = "deepseek-v4-flash";
 
     private ModelConfig() {
     }
@@ -28,6 +30,7 @@ public final class ModelConfig {
                 .apiKey(apiKey)
                 .baseUrl("https://api.deepseek.com")
                 .modelName(DEEPSEEK_API_MODEL_NAME)
+                .customParameters(Map.of("extra_body", Map.of("thinking", Map.of("type", "enabled"))))
                 .build();
     }
 

@@ -5,8 +5,8 @@ import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.ChatMessageDeserializer;
 import dev.langchain4j.data.message.ChatMessageSerializer;
 import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.model.chat.ChatLanguageModel;
-import dev.langchain4j.model.chat.StreamingChatLanguageModel;
+import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
 import dev.langchain4j.community.store.embedding.redis.RedisEmbeddingStore;
@@ -48,12 +48,12 @@ public class LangChainConfig {
     private String vectorPrefix;
 
     @Bean
-    public ChatLanguageModel chatLanguageModel() {
+    public ChatModel chatLanguageModel() {
         return ModelConfig.deepseekChatModel(deepseekApiKey);
     }
 
     @Bean
-    public StreamingChatLanguageModel streamingChatLanguageModel() {
+    public StreamingChatModel streamingChatLanguageModel() {
         return ModelConfig.deepseekStreamingChatModel(deepseekApiKey);
     }
 
