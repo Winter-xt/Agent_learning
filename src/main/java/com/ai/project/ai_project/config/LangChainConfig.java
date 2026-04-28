@@ -76,7 +76,11 @@ public class LangChainConfig {
                         "userId",
                         "fileName",
                         "contentType",
-                        "uploadedAt"
+                        "uploadedAt",
+                        "parentType",
+                        "parentIndex",
+                        "parentBlock",
+                        "childIndex"
                 ))
                 .build();
     }

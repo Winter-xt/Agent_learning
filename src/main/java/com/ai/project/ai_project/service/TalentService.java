@@ -55,17 +55,17 @@ public class TalentService {
     @PostConstruct
     public void init() throws IOException {
         // Load data into vector store
-        Path csvPath = Path.of("/Users/winter/Downloads/test_users.csv");
-        if (Files.exists(csvPath)) {
-            List<String> lines = Files.readAllLines(csvPath);
-            for (int i = 1; i < lines.size(); i++) {
-                String line = lines.get(i).trim();
-                if (!line.isEmpty()) {
-                    TextSegment segment = TextSegment.from(line);
-                    embeddingStore.add(embeddingModel.embed(segment).content(), segment);
-                }
-            }
-        }
+//        Path csvPath = Path.of("/Users/winter/Downloads/test_users.csv");
+//        if (Files.exists(csvPath)) {
+//            List<String> lines = Files.readAllLines(csvPath);
+//            for (int i = 1; i < lines.size(); i++) {
+//                String line = lines.get(i).trim();
+//                if (!line.isEmpty()) {
+//                    TextSegment segment = TextSegment.from(line);
+//                    embeddingStore.add(embeddingModel.embed(segment).content(), segment);
+//                }
+//            }
+//        }
         EmbeddingStoreContentRetriever retriever = EmbeddingStoreContentRetriever.builder()
                 .embeddingStore(embeddingStore)
                 .embeddingModel(embeddingModel)

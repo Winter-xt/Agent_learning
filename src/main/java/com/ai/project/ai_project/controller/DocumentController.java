@@ -49,4 +49,5 @@ public class DocumentController {
             throw new ResponseStatusException(BAD_REQUEST, e.getMessage(), e);
         }
     }
+
 }

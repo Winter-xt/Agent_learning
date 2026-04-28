@@ -5,17 +5,17 @@ import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.Metadata;
 import dev.langchain4j.data.document.parser.apache.tika.ApacheTikaDocumentParser;
 import dev.langchain4j.data.document.splitter.DocumentSplitters;
+import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.model.output.Response;
 import dev.langchain4j.rag.query.Query;
 import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
 import dev.langchain4j.service.AiServices;
 import dev.langchain4j.service.SystemMessage;
 import dev.langchain4j.service.UserMessage;
 import dev.langchain4j.store.embedding.EmbeddingStore;
-import dev.langchain4j.store.embedding.EmbeddingStoreIngestor;
-import dev.langchain4j.store.embedding.IngestionResult;
 import dev.langchain4j.store.embedding.filter.Filter;
 import dev.langchain4j.store.embedding.filter.logical.And;
 import org.springframework.stereotype.Service;
@@ -25,8 +25,11 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
 
@@ -34,12 +37,22 @@ import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metad
 public class DocumentLoader {
 
     private static final Set<String> SUPPORTED_EXTENSIONS = Set.of("pdf", "doc", "docx");
+    private static final String SOURCE_TYPE_RESUME = "resume";
+    private static final DocumentSplitter CHILD_SPLITTER = DocumentSplitters.recursive(200, 40);
+    private static final Pattern PROJECT_SECTION_HEADER = Pattern.compile(
+            "^(项目经历|项目经验|项目背景)(\\s*[A-Za-z0-9一二三四五六七八九十]+)?\\s*[:：]?$"
+    );
+    private static final Pattern GENERIC_SECTION_HEADER = Pattern.compile(
+            "^(基本信息|个人信息|联系方式|教育经历|工作经历|实习经历|项目经历|项目经验|专业技能|技能栈|技术栈|证书|获奖情况|自我评价|个人评价|个人总结)(\\s*[A-Za-z0-9一二三四五六七八九十]+)?\\s*[:：]?$"
+    );
+    private static final Pattern DATE_RANGE_PATTERN = Pattern.compile(
+            "(19|20)\\d{2}[./-]\\d{1,2}\\s*[-~到至]\\s*((19|20)\\d{2}[./-]\\d{1,2}|至今|现在)"
+    );
 
     private final ChatLanguageModel chatLanguageModel;
     private final EmbeddingModel embeddingModel;
     private final EmbeddingStore<TextSegment> embeddingStore;
     private final ApacheTikaDocumentParser parser;
-    private final DocumentSplitter splitter;
 
     public DocumentLoader(ChatLanguageModel chatLanguageModel,
                           EmbeddingModel embeddingModel,
@@ -48,7 +61,6 @@ public class DocumentLoader {
         this.embeddingModel = embeddingModel;
         this.embeddingStore = embeddingStore;
         this.parser = new ApacheTikaDocumentParser();
-        this.splitter = DocumentSplitters.recursive(500, 100);
     }
 
     public UploadResult loadResume(String userId, MultipartFile file) throws IOException {
@@ -76,29 +88,136 @@ public class DocumentLoader {
                 : parsedDocument.metadata().copy();
         metadata.put("userId", normalizedUserId);
         metadata.put("userIdKey", toHexKey(normalizedUserId));
-        metadata.put("sourceType", "resume");
+        metadata.put("sourceType", SOURCE_TYPE_RESUME);
         metadata.put("fileName", fileName == null ? "" : fileName);
         metadata.put("contentType", file.getContentType() == null ? "" : file.getContentType());
         metadata.put("uploadedAt", Instant.now().toString());
 
-        Document enrichedDocument = Document.from(text, metadata);
-        int segmentCount = splitter.split(enrichedDocument).size();
+        String normalizedText = normalizeText(text);
+        //拆分文档内容
+        List<ParentBlock> parentBlocks = extractParentBlocks(normalizedText);
+        if (parentBlocks.isEmpty()) {
+            parentBlocks = List.of(new ParentBlock("resume", normalizedText));
+        }
 
-        EmbeddingStoreIngestor ingestor = EmbeddingStoreIngestor.builder()
-                .embeddingModel(embeddingModel)
-                .embeddingStore(embeddingStore)
-                .documentSplitter(splitter)
-                .build();
+        List<TextSegment> childSegments = new ArrayList<>();
+        for (int i = 0; i < parentBlocks.size(); i++) {
+            ParentBlock parentBlock = parentBlocks.get(i);
+            Metadata parentMetadata = metadata.copy();
+            parentMetadata.put("parentType", parentBlock.type());
+            parentMetadata.put("parentIndex", String.valueOf(i));
+            parentMetadata.put("parentBlock", parentBlock.content());
 
-        IngestionResult ingestionResult = ingestor.ingest(enrichedDocument);
+            Document parentDocument = Document.from(parentBlock.content(), parentMetadata);
+            List<TextSegment> children = CHILD_SPLITTER.split(parentDocument);
+            for (int childIndex = 0; childIndex < children.size(); childIndex++) {
+                TextSegment child = children.get(childIndex);
+                if (child.text() == null || child.text().isBlank()) {
+                    continue;
+                }
+                Metadata childMetadata = child.metadata() == null ? new Metadata() : child.metadata().copy();
+                childMetadata.put("childIndex", String.valueOf(childIndex));
+                childSegments.add(TextSegment.from(child.text().trim(), childMetadata));
+            }
+        }
+
+        if (childSegments.isEmpty()) {
+            throw new IllegalArgumentException("文档分片为空，无法入库");
+        }
+
+        Response<List<Embedding>> response = embeddingModel.embedAll(childSegments);
+        embeddingStore.addAll(response.content(), childSegments);
 
         return new UploadResult(
                 normalizedUserId,
                 fileName == null ? "" : fileName,
-                segmentCount,
+                childSegments.size(),
                 text.length(),
-                ingestionResult.tokenUsage() == null ? null : ingestionResult.tokenUsage().totalTokenCount()
+                response.tokenUsage() == null ? null : response.tokenUsage().totalTokenCount()
         );
+    }
+
+    private String normalizeText(String text) {
+        return text.replace("\r\n", "\n").replace('\r', '\n').replaceAll("\n{3,}", "\n\n").trim();
+    }
+
+    private List<ParentBlock> extractParentBlocks(String text) {
+        List<ParentBlock> blocks = new ArrayList<>();
+        String[] lines = text.split("\n");
+
+        String currentType = "resume";
+        StringBuilder current = new StringBuilder();
+        for (String line : lines) {
+            String trimmed = line == null ? "" : line.trim();
+            if (trimmed.isBlank()) {
+                if (!current.isEmpty()) {
+                    current.append('\n');
+                }
+                continue;
+            }
+
+            if (isSectionHeader(trimmed)) {
+                appendBlock(blocks, currentType, current);
+                current = new StringBuilder();
+                currentType = PROJECT_SECTION_HEADER.matcher(trimmed).matches() ? "project" : "resume";
+                current.append(trimmed);
+                continue;
+            }
+
+            if (!current.isEmpty()) {
+                current.append('\n');
+            }
+            current.append(trimmed);
+        }
+
+        appendBlock(blocks, currentType, current);
+        return blocks;
+    }
+
+    private boolean isSectionHeader(String line) {
+        if (line.length() > 50) {
+            return false;
+        }
+        return GENERIC_SECTION_HEADER.matcher(line).matches();
+    }
+
+    private void appendBlock(List<ParentBlock> blocks, String type, StringBuilder content) {
+        String value = content.toString().trim();
+        if (!value.isBlank()) {
+            String resolvedType = resolveParentType(type, value);
+            blocks.add(new ParentBlock(resolvedType, value));
+        }
+    }
+
+    private String resolveParentType(String headerType, String content) {
+        if ("project".equals(headerType)) {
+            return "project";
+        }
+        if (looksLikeProjectContent(content)) {
+            return "project";
+        }
+        return "resume";
+    }
+
+    private boolean looksLikeProjectContent(String content) {
+        if (content == null || content.isBlank()) {
+            return false;
+        }
+
+        boolean hasDateRange = DATE_RANGE_PATTERN.matcher(content).find();
+        boolean hasProjectNouns = containsAny(content, "项目", "系统", "平台", "业务", "架构");
+        boolean hasWorkSignals = containsAny(content, "负责", "主导", "实现", "优化", "设计", "技术方案", "性能");
+
+        return (hasDateRange && hasProjectNouns) || (hasProjectNouns && hasWorkSignals);
+    }
+
+    private boolean containsAny(String text, String... keywords) {
+        for (String keyword : keywords) {
+            if (text.contains(keyword)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void validateExtension(String fileName) {
@@ -123,7 +242,7 @@ public class DocumentLoader {
 
         Filter filter = new And(
                 metadataKey("userIdKey").isEqualTo(toHexKey(normalizedUserId)),
-                metadataKey("sourceType").isEqualTo("resume")
+                metadataKey("sourceType").isEqualTo(SOURCE_TYPE_RESUME)
         );
 
         EmbeddingStoreContentRetriever retriever = EmbeddingStoreContentRetriever.builder()
@@ -145,6 +264,7 @@ public class DocumentLoader {
 
         return assistant.answer(query);
     }
+
 
     interface ResumeQaAssistant {
         @SystemMessage("""
@@ -172,6 +292,9 @@ public class DocumentLoader {
         return userId.trim();
     }
 
+    private record ParentBlock(String type, String content) {
+    }
+
     public record UploadResult(
             String userId,
             String fileName,
@@ -180,4 +303,5 @@ public class DocumentLoader {
             Integer embeddingTokenCount
     ) {
     }
+
 }
