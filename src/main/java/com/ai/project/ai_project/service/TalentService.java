@@ -1,6 +1,8 @@
 package com.ai.project.ai_project.service;
 
 import com.ai.project.ai_project.tools.FinancialTools;
+import com.ai.project.ai_project.util.IntentRoutingUtils;
+import com.ai.project.ai_project.util.MemoryIdUtils;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
 import dev.langchain4j.model.chat.ChatModel;
@@ -18,15 +20,13 @@ import jakarta.annotation.PostConstruct;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
 
 @Service
 public class TalentService {
     private static final String MEMORY_CATEGORY = "talent";
     private static final String MEMORY_SCOPE_SEPARATOR = "::";
+    private static final int MAX_CHAT_MEMORY_MESSAGES = 10;
+    private static final int RAG_MAX_RESULTS = 3;
 
     private final ChatModel chatLanguageModel;
     private final StreamingChatModel streamingChatLanguageModel;
@@ -35,8 +35,11 @@ public class TalentService {
     private final ChatMemoryStore chatMemoryStore;
     private final FinancialTools financialTools;
 
+    private AiService intentClassifier;
     private TalentAnalyst analyst;
+    private TalentAnalyst analystWithoutRag;
     private StreamingTalentAnalyst streamingAnalyst;
+    private StreamingTalentAnalyst streamingAnalystWithoutRag;
 
     public TalentService(ChatModel chatLanguageModel,
                          StreamingChatModel streamingChatLanguageModel,
@@ -54,58 +57,91 @@ public class TalentService {
 
     @PostConstruct
     public void init() throws IOException {
-        // Load data into vector store
-//        Path csvPath = Path.of("/Users/winter/Downloads/test_users.csv");
-//        if (Files.exists(csvPath)) {
-//            List<String> lines = Files.readAllLines(csvPath);
-//            for (int i = 1; i < lines.size(); i++) {
-//                String line = lines.get(i).trim();
-//                if (!line.isEmpty()) {
-//                    TextSegment segment = TextSegment.from(line);
-//                    embeddingStore.add(embeddingModel.embed(segment).content(), segment);
-//                }
-//            }
-//        }
-        EmbeddingStoreContentRetriever retriever = EmbeddingStoreContentRetriever.builder()
-                .embeddingStore(embeddingStore)
-                .embeddingModel(embeddingModel)
-                .maxResults(3)
-                .build();
+        EmbeddingStoreContentRetriever retriever = buildRetriever();
 
-        this.analyst = AiServices.builder(TalentAnalyst.class)
+        this.intentClassifier = AiServices.builder(AiService.class)
                 .chatModel(chatLanguageModel)
-                .chatMemoryProvider(memoryId -> MessageWindowChatMemory.builder()
-                        .id(memoryId)
-                        .maxMessages(10)
-                        .chatMemoryStore(chatMemoryStore)
-                        .build())
-                .contentRetriever(retriever)
-                .tools(financialTools)
                 .build();
 
-        this.streamingAnalyst = AiServices.builder(StreamingTalentAnalyst.class)
-                .streamingChatModel(streamingChatLanguageModel)
-                .chatMemoryProvider(memoryId -> MessageWindowChatMemory.builder()
-                        .id(memoryId)
-                        .maxMessages(10)
-                        .chatMemoryStore(chatMemoryStore)
-                        .build())
-                .contentRetriever(retriever)
-                .tools(financialTools)
-                .build();
+        this.analyst = buildAnalyst(true, retriever);
+        this.analystWithoutRag = buildAnalyst(false, retriever);
+        this.streamingAnalyst = buildStreamingAnalyst(true, retriever);
+        this.streamingAnalystWithoutRag = buildStreamingAnalyst(false, retriever);
     }
 
+    /**
+     * 同步问答入口：
+     * 1) 先识别用户意图
+     * 2) 再根据意图选择是否启用 RAG
+     */
     public String analyze(String userId, String query) {
-        return analyst.analyze(scopedMemoryId(userId), query);
+        Intent intent = classifyIntent(query);
+        if (IntentRoutingUtils.shouldUseRag(intent)) {
+            return analyst.analyze(scopedMemoryId(userId), query);
+        }
+        return analystWithoutRag.analyze(scopedMemoryId(userId), query);
     }
 
+    /**
+     * 流式问答入口：
+     * 与同步入口保持一致的路由策略，避免两条链路行为不一致。
+     */
     public TokenStream analyzeStream(String userId, String query) {
-        return streamingAnalyst.analyze(scopedMemoryId(userId), query);
+        Intent intent = classifyIntent(query);
+        if (IntentRoutingUtils.shouldUseRag(intent)) {
+            return streamingAnalyst.analyze(scopedMemoryId(userId), query);
+        }
+        return streamingAnalystWithoutRag.analyze(scopedMemoryId(userId), query);
+    }
+
+    /**
+     * 使用轻量分类模型将用户问题映射为业务意图，解析失败时回退 UNKNOWN。
+     */
+    private Intent classifyIntent(String query) {
+        String label = intentClassifier.classify(query);
+        return IntentRoutingUtils.parseIntentLabel(label);
     }
 
     private String scopedMemoryId(String userId) {
-        String safeUserId = (userId == null || userId.isBlank()) ? "default-user" : userId;
-        return MEMORY_CATEGORY + MEMORY_SCOPE_SEPARATOR + safeUserId;
+        return MemoryIdUtils.buildScopedMemoryId(MEMORY_CATEGORY, MEMORY_SCOPE_SEPARATOR, userId);
+    }
+
+    private EmbeddingStoreContentRetriever buildRetriever() {
+        return EmbeddingStoreContentRetriever.builder()
+                .embeddingStore(embeddingStore)
+                .embeddingModel(embeddingModel)
+                .maxResults(RAG_MAX_RESULTS)
+                .build();
+    }
+
+    private MessageWindowChatMemory buildChatMemory(Object memoryId) {
+        return MessageWindowChatMemory.builder()
+                .id(memoryId)
+                .maxMessages(MAX_CHAT_MEMORY_MESSAGES)
+                .chatMemoryStore(chatMemoryStore)
+                .build();
+    }
+
+    private TalentAnalyst buildAnalyst(boolean useRag, EmbeddingStoreContentRetriever retriever) {
+        AiServices<TalentAnalyst> builder = AiServices.builder(TalentAnalyst.class)
+                .chatModel(chatLanguageModel)
+                .chatMemoryProvider(this::buildChatMemory)
+                .tools(financialTools);
+        if (useRag) {
+            builder.contentRetriever(retriever);
+        }
+        return builder.build();
+    }
+
+    private StreamingTalentAnalyst buildStreamingAnalyst(boolean useRag, EmbeddingStoreContentRetriever retriever) {
+        AiServices<StreamingTalentAnalyst> builder = AiServices.builder(StreamingTalentAnalyst.class)
+                .streamingChatModel(streamingChatLanguageModel)
+                .chatMemoryProvider(this::buildChatMemory)
+                .tools(financialTools);
+        if (useRag) {
+            builder.contentRetriever(retriever);
+        }
+        return builder.build();
     }
 
     public interface TalentAnalyst {

@@ -2,6 +2,8 @@ package com.ai.project.ai_project.service;
 
 import com.ai.project.ai_project.domain.ResumeParentBlockEntity;
 import com.ai.project.ai_project.mapper.ResumeParentBlockMapper;
+import com.ai.project.ai_project.util.IntentRoutingUtils;
+import com.ai.project.ai_project.util.ResumeTextUtils;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.Metadata;
@@ -12,6 +14,7 @@ import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.output.Response;
+import dev.langchain4j.service.AiServices;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingStore;
@@ -49,15 +52,6 @@ public class DocumentLoader {
     private static final String PARENT_BLOCK_CACHE_KEY_PREFIX = "resume:parent:block:";
     private static final int PARENT_BLOCK_CACHE_TTL_SECONDS = 24 * 60 * 60;
     private static final DocumentSplitter CHILD_SPLITTER = DocumentSplitters.recursive(200, 40);
-    private static final Pattern PROJECT_SECTION_HEADER = Pattern.compile(
-            "^(项目经历|项目经验|项目背景)(\\s*[A-Za-z0-9一二三四五六七八九十]+)?\\s*[:：]?$"
-    );
-    private static final Pattern GENERIC_SECTION_HEADER = Pattern.compile(
-            "^(基本信息|个人信息|联系方式|教育经历|工作经历|实习经历|项目经历|项目经验|专业技能|技能栈|技术栈|证书|获奖情况|自我评价|个人评价|个人总结)(\\s*[A-Za-z0-9一二三四五六七八九十]+)?\\s*[:：]?$"
-    );
-    private static final Pattern DATE_RANGE_PATTERN = Pattern.compile(
-            "(19|20)\\d{2}[./-]\\d{1,2}\\s*[-~到至]\\s*((19|20)\\d{2}[./-]\\d{1,2}|至今|现在)"
-    );
 
     private final ChatModel chatLanguageModel;
     private final EmbeddingModel embeddingModel;
@@ -68,6 +62,7 @@ public class DocumentLoader {
     private final String vectorIndexName;
     private final double vectorRecallWeight;
     private final double keywordRecallWeight;
+    private final AiService intentClassifier;
 
     public DocumentLoader(ChatModel chatLanguageModel,
                           EmbeddingModel embeddingModel,
@@ -86,6 +81,9 @@ public class DocumentLoader {
         this.vectorRecallWeight = vectorRecallWeight;
         this.keywordRecallWeight = keywordRecallWeight;
         this.vectorIndexName = vectorIndexName;
+        this.intentClassifier = AiServices.builder(AiService.class)
+                .chatModel(chatLanguageModel)
+                .build();
     }
 
     @Transactional(rollbackFor = Exception.class)
@@ -94,7 +92,7 @@ public class DocumentLoader {
             throw new IllegalArgumentException("上传文件不能为空");
         }
 
-        String normalizedUserId = normalizeUserId(userId);
+        String normalizedUserId = ResumeTextUtils.normalizeUserId(userId);
 
         String fileName = file.getOriginalFilename();
         validateExtension(fileName);
@@ -113,14 +111,14 @@ public class DocumentLoader {
                 ? new Metadata()
                 : parsedDocument.metadata().copy();
         metadata.put("userId", normalizedUserId);
-        metadata.put("userIdKey", toHexKey(normalizedUserId));
+        metadata.put("userIdKey", ResumeTextUtils.toHexKey(normalizedUserId));
         metadata.put("sourceType", SOURCE_TYPE_RESUME);
         metadata.put("fileName", fileName == null ? "" : fileName);
         metadata.put("contentType", file.getContentType() == null ? "" : file.getContentType());
         metadata.put("uploadedAt", Instant.now().toString());
 
-        String normalizedText = normalizeText(text);
-        String userIdKey = toHexKey(normalizedUserId);
+        String normalizedText = ResumeTextUtils.normalizeText(text);
+        String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
         purgeExistingResumeData(userIdKey);
 
         //拆分文档内容作为父文档并存储
@@ -167,10 +165,9 @@ public class DocumentLoader {
         );
     }
 
-    private String normalizeText(String text) {
-        return text.replace("\r\n", "\n").replace('\r', '\n').replaceAll("\n{3,}", "\n\n").trim();
-    }
-
+    /**
+     * 将解析出的简历文本按“父块”切分，便于后续父子分片和去重召回。
+     */
     private List<ParentBlock> extractParentBlocks(String text) {
         List<ParentBlock> blocks = new ArrayList<>();
         String[] lines = text.split("\n");
@@ -186,10 +183,10 @@ public class DocumentLoader {
                 continue;
             }
 
-            if (isSectionHeader(trimmed)) {
+            if (ResumeTextUtils.isSectionHeader(trimmed)) {
                 appendBlock(blocks, currentType, current);
                 current = new StringBuilder();
-                currentType = PROJECT_SECTION_HEADER.matcher(trimmed).matches() ? "project" : "resume";
+                currentType = ResumeTextUtils.isProjectHeader(trimmed) ? "project" : "resume";
                 current.append(trimmed);
                 continue;
             }
@@ -204,50 +201,12 @@ public class DocumentLoader {
         return blocks;
     }
 
-    private boolean isSectionHeader(String line) {
-        if (line.length() > 50) {
-            return false;
-        }
-        return GENERIC_SECTION_HEADER.matcher(line).matches();
-    }
-
     private void appendBlock(List<ParentBlock> blocks, String type, StringBuilder content) {
         String value = content.toString().trim();
         if (!value.isBlank()) {
-            String resolvedType = resolveParentType(type, value);
+            String resolvedType = ResumeTextUtils.resolveParentType(type, value);
             blocks.add(new ParentBlock(resolvedType, value));
         }
-    }
-
-    private String resolveParentType(String headerType, String content) {
-        if ("project".equals(headerType)) {
-            return "project";
-        }
-        if (looksLikeProjectContent(content)) {
-            return "project";
-        }
-        return "resume";
-    }
-
-    private boolean looksLikeProjectContent(String content) {
-        if (content == null || content.isBlank()) {
-            return false;
-        }
-
-        boolean hasDateRange = DATE_RANGE_PATTERN.matcher(content).find();
-        boolean hasProjectNouns = containsAny(content, "项目", "系统", "平台", "业务", "架构");
-        boolean hasWorkSignals = containsAny(content, "负责", "主导", "实现", "优化", "设计", "技术方案", "性能");
-
-        return (hasDateRange && hasProjectNouns) || (hasProjectNouns && hasWorkSignals);
-    }
-
-    private boolean containsAny(String text, String... keywords) {
-        for (String keyword : keywords) {
-            if (text.contains(keyword)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private void validateExtension(String fileName) {
@@ -260,22 +219,43 @@ public class DocumentLoader {
         }
     }
 
+    /**
+     * 简历问答入口：
+     * 先做意图判断，再决定是否执行简历 RAG 检索。
+     */
     public String queryResume(String userId, String query) {
-        if (query == null || query.isBlank()) {
-            throw new IllegalArgumentException("query 不能为空");
-        }
-        if (userId == null || userId.isBlank()) {
-            throw new IllegalArgumentException("userId 不能为空");
+        validateResumeQueryParams(userId, query);
+
+        Intent intent = classifyIntent(query);
+        if (shouldUseResumeRag(intent)) {
+            return queryResumeWithRag(userId, query);
         }
 
-        String normalizedUserId = normalizeUserId(userId);
+        String prompt = """
+                你是一个招聘助手。
+                当前用户在“简历问答”通道提问，但该问题更偏向闲聊或意图不明确。
+                请先简短回应用户，并引导用户提出与简历检索相关的问题，例如：
+                - 候选人有哪些项目经验？
+                - 候选人是否有 Java/Spring 经验？
+
+                用户问题：%s
+                """.formatted(query);
+        return chatLanguageModel.chat(prompt);
+    }
+
+    /**
+     * 简历 RAG 检索问答：
+     * 向量召回 + Redis关键词召回混合排序，最后交给大模型基于上下文回答。
+     */
+    private String queryResumeWithRag(String userId, String query) {
+        String normalizedUserId = ResumeTextUtils.normalizeUserId(userId);
 
         Filter filter = new And(
-                metadataKey("userIdKey").isEqualTo(toHexKey(normalizedUserId)),
+                metadataKey("userIdKey").isEqualTo(ResumeTextUtils.toHexKey(normalizedUserId)),
                 metadataKey("sourceType").isEqualTo(SOURCE_TYPE_RESUME)
         );
 
-        String userIdKey = toHexKey(normalizedUserId);
+        String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
         EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
                 .queryEmbedding(embeddingModel.embed(query).content())
                 .maxResults(12)
@@ -310,6 +290,24 @@ public class DocumentLoader {
         return chatLanguageModel.chat(prompt);
     }
 
+    private void validateResumeQueryParams(String userId, String query) {
+        if (query == null || query.isBlank()) {
+            throw new IllegalArgumentException("query 不能为空");
+        }
+        if (userId == null || userId.isBlank()) {
+            throw new IllegalArgumentException("userId 不能为空");
+        }
+    }
+
+    private Intent classifyIntent(String query) {
+        String label = intentClassifier.classify(query);
+        return IntentRoutingUtils.parseIntentLabel(label);
+    }
+
+    private boolean shouldUseResumeRag(Intent intent) {
+        return intent == Intent.RESUME_QUERY;
+    }
+
     private List<EmbeddingMatch<TextSegment>> searchVectorMatchesWithFallback(EmbeddingSearchRequest request,
                                                                                String userIdKey) {
         List<EmbeddingMatch<TextSegment>> primary = embeddingStore.search(request).matches();
@@ -325,12 +323,15 @@ public class DocumentLoader {
                 .build();
         return embeddingStore.search(fallbackRequest).matches().stream()
                 .filter(match -> match.embedded() != null && match.embedded().metadata() != null)
-                .filter(match -> SOURCE_TYPE_RESUME.equals(safe(match.embedded().metadata().getString("sourceType"))))
-                .filter(match -> userIdKey.equals(safe(match.embedded().metadata().getString("userIdKey"))))
+                .filter(match -> SOURCE_TYPE_RESUME.equals(ResumeTextUtils.safe(match.embedded().metadata().getString("sourceType"))))
+                .filter(match -> userIdKey.equals(ResumeTextUtils.safe(match.embedded().metadata().getString("userIdKey"))))
                 .limit(12)
                 .toList();
     }
 
+    /**
+     * 将向量召回与关键词召回融合后，按父块去重并输出可直接拼接到 Prompt 的上下文片段。
+     */
     private List<String> collectHybridParentContexts(List<EmbeddingMatch<TextSegment>> vectorMatches,
                                                      List<KeywordHit> keywordHits,
                                                      int maxParents) {
@@ -343,10 +344,10 @@ public class DocumentLoader {
                 continue;
             }
             Metadata metadata = segment.metadata();
-            String parentIndex = metadata == null ? "" : safe(metadata.getString("parentIndex"));
-            String parentType = metadata == null ? "" : safe(metadata.getString("parentType"));
-            Long parentBlockId = parseParentBlockId(metadata == null ? "" : safe(metadata.getString("parentBlockId")));
-            String fallback = safe(segment.text());
+            String parentIndex = metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("parentIndex"));
+            String parentType = metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("parentType"));
+            Long parentBlockId = parseParentBlockId(metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("parentBlockId")));
+            String fallback = ResumeTextUtils.safe(segment.text());
 
             String parentKey = parentIndex.isBlank() ? "fallback-" + fallback.hashCode() : parentIndex;
             String context = fallback;
@@ -390,7 +391,7 @@ public class DocumentLoader {
                 .limit(maxParents)
                 .map(candidate -> {
                     String type = candidate.parentType().isBlank() ? "resume" : candidate.parentType();
-                    String dbContent = candidate.parentBlockId() == null ? "" : safe(parentContentById.get(candidate.parentBlockId()));
+                    String dbContent = candidate.parentBlockId() == null ? "" : ResumeTextUtils.safe(parentContentById.get(candidate.parentBlockId()));
                     String content = dbContent.isBlank() ? candidate.context() : dbContent;
                     return "【parentType=" + type + ", parentIndex=" + candidate.parentKey() + "】\n" + content;
                 })
@@ -399,8 +400,8 @@ public class DocumentLoader {
 
     private List<KeywordHit> searchKeywordHits(String normalizedUserId, String query, int limit) {
         try {
-            String userIdKey = toHexKey(normalizedUserId);
-            String textClause = buildRedisTextClause(query);
+            String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
+            String textClause = ResumeTextUtils.buildRedisTextClause(query);
             if (textClause.isBlank()) {
                 return List.of();
             }
@@ -427,9 +428,9 @@ public class DocumentLoader {
             return new KeywordHit("", "", "");
         }
         return new KeywordHit(
-                safe(doc.getString("parentType")),
-                safe(doc.getString("parentIndex")),
-                safe(doc.getString("parentBlockId"))
+                ResumeTextUtils.safe(doc.getString("parentType")),
+                ResumeTextUtils.safe(doc.getString("parentIndex")),
+                ResumeTextUtils.safe(doc.getString("parentBlockId"))
         );
     }
 
@@ -484,7 +485,7 @@ public class DocumentLoader {
         Map<Long, String> contentById = new LinkedHashMap<>();
         List<Long> missedIds = new ArrayList<>();
         for (Long parentBlockId : parentBlockIds) {
-            String cached = safe(readParentBlockFromCache(parentBlockId));
+            String cached = ResumeTextUtils.safe(readParentBlockFromCache(parentBlockId));
             if (!cached.isBlank()) {
                 contentById.put(parentBlockId, cached);
             } else {
@@ -503,7 +504,7 @@ public class DocumentLoader {
             if (entity == null || entity.getId() == null) {
                 continue;
             }
-            String content = safe(entity.getContent());
+            String content = ResumeTextUtils.safe(entity.getContent());
             contentById.put(entity.getId(), content);
             writeParentBlockToCache(entity.getId(), content);
         }
@@ -511,7 +512,7 @@ public class DocumentLoader {
     }
 
     private Long parseParentBlockId(String rawId) {
-        String value = safe(rawId);
+        String value = ResumeTextUtils.safe(rawId);
         if (value.isBlank()) {
             return null;
         }
@@ -520,57 +521,6 @@ public class DocumentLoader {
         } catch (NumberFormatException ignored) {
             return null;
         }
-    }
-
-    private String buildRedisTextClause(String query) {
-        String normalized = safe(query);
-        if (normalized.isBlank()) {
-            return "";
-        }
-        List<String> tokens = Pattern.compile("[\\s,，。！？；;:：()（）\\-_/\\.]+")
-                .splitAsStream(normalized)
-                .filter(token -> !token.isBlank())
-                .toList();
-        if (tokens.isEmpty()) {
-            return "";
-        }
-
-        // Keep insertion order while avoiding duplicated clauses.
-        Set<String> clauses = new LinkedHashSet<>();
-        String escapedWhole = normalized.replaceAll("([\\\\@{}\\[\\]\\(\\)\\|\\-!~\"'])", "\\\\$1");
-        if (!escapedWhole.isBlank()) {
-            // Keep the original string as one term for values like cert IDs with special chars.
-            clauses.add("\"" + escapedWhole + "\"");
-        }
-        for (String rawToken : tokens) {
-            String token = rawToken.toLowerCase(Locale.ROOT).trim();
-            if (token.isBlank()) {
-                continue;
-            }
-            String escaped = token.replaceAll("([\\\\@{}\\[\\]\\(\\)\\|\\-!~\"'])", "\\\\$1");
-            clauses.add(escaped);
-            // Chinese terms benefit from prefix matching, e.g. "证书" -> "证书*"
-            if (containsHan(token) && token.length() >= 2) {
-                clauses.add(escaped + "*");
-            }
-        }
-        if (clauses.isEmpty()) {
-            return "";
-        }
-        return String.join(" | ", clauses);
-    }
-
-    private boolean containsHan(String text) {
-        if (text == null || text.isBlank()) {
-            return false;
-        }
-        for (int i = 0; i < text.length(); i++) {
-            Character.UnicodeScript script = Character.UnicodeScript.of(text.charAt(i));
-            if (script == Character.UnicodeScript.HAN) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private double weightedReciprocalRank(int rankIndex, double weight) {
@@ -603,27 +553,6 @@ public class DocumentLoader {
 
     private String parentBlockCacheKey(Long parentBlockId) {
         return PARENT_BLOCK_CACHE_KEY_PREFIX + parentBlockId;
-    }
-
-    private String safe(String value) {
-        return value == null ? "" : value.trim();
-    }
-
-    private String toHexKey(String raw) {
-        String value = raw == null ? "" : raw;
-        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
-        StringBuilder sb = new StringBuilder(bytes.length * 2);
-        for (byte b : bytes) {
-            sb.append(String.format("%02x", b));
-        }
-        return sb.toString();
-    }
-
-    private String normalizeUserId(String userId) {
-        if (userId == null || userId.isBlank()) {
-            return "default-user";
-        }
-        return userId.trim();
     }
 
     private record ParentBlock(String type, String content) {
