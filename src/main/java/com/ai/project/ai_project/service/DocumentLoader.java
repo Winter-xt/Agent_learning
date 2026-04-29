@@ -46,6 +46,8 @@ public class DocumentLoader {
     private static final Set<String> SUPPORTED_EXTENSIONS = Set.of("pdf", "doc", "docx");
     private static final String SOURCE_TYPE_RESUME = "resume";
     private static final int REDIS_PURGE_BATCH_SIZE = 200;
+    private static final String PARENT_BLOCK_CACHE_KEY_PREFIX = "resume:parent:block:";
+    private static final int PARENT_BLOCK_CACHE_TTL_SECONDS = 24 * 60 * 60;
     private static final DocumentSplitter CHILD_SPLITTER = DocumentSplitters.recursive(200, 40);
     private static final Pattern PROJECT_SECTION_HEADER = Pattern.compile(
             "^(项目经历|项目经验|项目背景)(\\s*[A-Za-z0-9一二三四五六七八九十]+)?\\s*[:：]?$"
@@ -64,12 +66,16 @@ public class DocumentLoader {
     private final ResumeParentBlockMapper resumeParentBlockMapper;
     private final ApacheTikaDocumentParser parser;
     private final String vectorIndexName;
+    private final double vectorRecallWeight;
+    private final double keywordRecallWeight;
 
     public DocumentLoader(ChatModel chatLanguageModel,
                           EmbeddingModel embeddingModel,
                           EmbeddingStore<TextSegment> embeddingStore,
                           UnifiedJedis unifiedJedis,
                           ResumeParentBlockMapper resumeParentBlockMapper,
+                          @org.springframework.beans.factory.annotation.Value("${app.recall.vector-weight:1.0}") double vectorRecallWeight,
+                          @org.springframework.beans.factory.annotation.Value("${app.recall.keyword-weight:1.0}") double keywordRecallWeight,
                           @org.springframework.beans.factory.annotation.Value("${app.vector.index-name:talent-index-v2}") String vectorIndexName) {
         this.chatLanguageModel = chatLanguageModel;
         this.embeddingModel = embeddingModel;
@@ -77,6 +83,8 @@ public class DocumentLoader {
         this.unifiedJedis = unifiedJedis;
         this.resumeParentBlockMapper = resumeParentBlockMapper;
         this.parser = new ApacheTikaDocumentParser();
+        this.vectorRecallWeight = vectorRecallWeight;
+        this.keywordRecallWeight = keywordRecallWeight;
         this.vectorIndexName = vectorIndexName;
     }
 
@@ -342,7 +350,7 @@ public class DocumentLoader {
 
             String parentKey = parentIndex.isBlank() ? "fallback-" + fallback.hashCode() : parentIndex;
             String context = fallback;
-            double score = reciprocalRank(i);
+            double score = weightedReciprocalRank(i, vectorRecallWeight);
 
             ParentCandidate incoming = new ParentCandidate(parentKey, parentType, parentBlockId, context, score);
             ParentCandidate existing = candidates.get(parentKey);
@@ -355,7 +363,7 @@ public class DocumentLoader {
             KeywordHit hit = keywordHits.get(i);
             String parentKey = hit.parentIndex().isBlank() ? "kw-" + i : hit.parentIndex();
             ParentCandidate existing = candidates.get(parentKey);
-            double score = reciprocalRank(i);
+            double score = weightedReciprocalRank(i, keywordRecallWeight);
             Long keywordParentBlockId = parseParentBlockId(hit.parentBlockId());
             if (existing == null) {
                 candidates.put(parentKey, new ParentCandidate(parentKey, hit.parentType(), keywordParentBlockId, "", score));
@@ -473,16 +481,31 @@ public class DocumentLoader {
         if (parentBlockIds == null || parentBlockIds.isEmpty()) {
             return Map.of();
         }
-        List<ResumeParentBlockEntity> entities = resumeParentBlockMapper.selectBatchIds(parentBlockIds);
-        if (entities == null || entities.isEmpty()) {
-            return Map.of();
-        }
         Map<Long, String> contentById = new LinkedHashMap<>();
+        List<Long> missedIds = new ArrayList<>();
+        for (Long parentBlockId : parentBlockIds) {
+            String cached = safe(readParentBlockFromCache(parentBlockId));
+            if (!cached.isBlank()) {
+                contentById.put(parentBlockId, cached);
+            } else {
+                missedIds.add(parentBlockId);
+            }
+        }
+        if (missedIds.isEmpty()) {
+            return contentById;
+        }
+
+        List<ResumeParentBlockEntity> entities = resumeParentBlockMapper.selectBatchIds(missedIds);
+        if (entities == null || entities.isEmpty()) {
+            return contentById;
+        }
         for (ResumeParentBlockEntity entity : entities) {
             if (entity == null || entity.getId() == null) {
                 continue;
             }
-            contentById.put(entity.getId(), safe(entity.getContent()));
+            String content = safe(entity.getContent());
+            contentById.put(entity.getId(), content);
+            writeParentBlockToCache(entity.getId(), content);
         }
         return contentById;
     }
@@ -514,6 +537,11 @@ public class DocumentLoader {
 
         // Keep insertion order while avoiding duplicated clauses.
         Set<String> clauses = new LinkedHashSet<>();
+        String escapedWhole = normalized.replaceAll("([\\\\@{}\\[\\]\\(\\)\\|\\-!~\"'])", "\\\\$1");
+        if (!escapedWhole.isBlank()) {
+            // Keep the original string as one term for values like cert IDs with special chars.
+            clauses.add("\"" + escapedWhole + "\"");
+        }
         for (String rawToken : tokens) {
             String token = rawToken.toLowerCase(Locale.ROOT).trim();
             if (token.isBlank()) {
@@ -545,8 +573,36 @@ public class DocumentLoader {
         return false;
     }
 
-    private double reciprocalRank(int rankIndex) {
-        return 1.0d / (rankIndex + 60.0d);
+    private double weightedReciprocalRank(int rankIndex, double weight) {
+        return weight / (rankIndex + 60.0d);
+    }
+
+    private String readParentBlockFromCache(Long parentBlockId) {
+        if (parentBlockId == null || parentBlockId <= 0) {
+            return "";
+        }
+        try {
+            return unifiedJedis.hget(parentBlockCacheKey(parentBlockId), "content");
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    private void writeParentBlockToCache(Long parentBlockId, String content) {
+        if (parentBlockId == null || parentBlockId <= 0 || content == null || content.isBlank()) {
+            return;
+        }
+        String key = parentBlockCacheKey(parentBlockId);
+        try {
+            unifiedJedis.hset(key, "content", content);
+            unifiedJedis.expire(key, PARENT_BLOCK_CACHE_TTL_SECONDS);
+        } catch (Exception ignored) {
+            // Ignore cache write failure and keep DB as source of truth.
+        }
+    }
+
+    private String parentBlockCacheKey(Long parentBlockId) {
+        return PARENT_BLOCK_CACHE_KEY_PREFIX + parentBlockId;
     }
 
     private String safe(String value) {
