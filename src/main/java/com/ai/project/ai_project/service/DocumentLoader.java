@@ -1,5 +1,7 @@
 package com.ai.project.ai_project.service;
 
+import com.ai.project.ai_project.domain.ResumeParentBlockEntity;
+import com.ai.project.ai_project.mapper.ResumeParentBlockMapper;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.Metadata;
@@ -16,6 +18,7 @@ import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.filter.Filter;
 import dev.langchain4j.store.embedding.filter.logical.And;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 import redis.clients.jedis.UnifiedJedis;
 import redis.clients.jedis.search.FTSearchParams;
@@ -42,6 +45,7 @@ public class DocumentLoader {
 
     private static final Set<String> SUPPORTED_EXTENSIONS = Set.of("pdf", "doc", "docx");
     private static final String SOURCE_TYPE_RESUME = "resume";
+    private static final int REDIS_PURGE_BATCH_SIZE = 200;
     private static final DocumentSplitter CHILD_SPLITTER = DocumentSplitters.recursive(200, 40);
     private static final Pattern PROJECT_SECTION_HEADER = Pattern.compile(
             "^(项目经历|项目经验|项目背景)(\\s*[A-Za-z0-9一二三四五六七八九十]+)?\\s*[:：]?$"
@@ -57,6 +61,7 @@ public class DocumentLoader {
     private final EmbeddingModel embeddingModel;
     private final EmbeddingStore<TextSegment> embeddingStore;
     private final UnifiedJedis unifiedJedis;
+    private final ResumeParentBlockMapper resumeParentBlockMapper;
     private final ApacheTikaDocumentParser parser;
     private final String vectorIndexName;
 
@@ -64,15 +69,18 @@ public class DocumentLoader {
                           EmbeddingModel embeddingModel,
                           EmbeddingStore<TextSegment> embeddingStore,
                           UnifiedJedis unifiedJedis,
+                          ResumeParentBlockMapper resumeParentBlockMapper,
                           @org.springframework.beans.factory.annotation.Value("${app.vector.index-name:talent-index-v2}") String vectorIndexName) {
         this.chatLanguageModel = chatLanguageModel;
         this.embeddingModel = embeddingModel;
         this.embeddingStore = embeddingStore;
         this.unifiedJedis = unifiedJedis;
+        this.resumeParentBlockMapper = resumeParentBlockMapper;
         this.parser = new ApacheTikaDocumentParser();
         this.vectorIndexName = vectorIndexName;
     }
 
+    @Transactional(rollbackFor = Exception.class)
     public UploadResult loadResume(String userId, MultipartFile file) throws IOException {
         if (file == null || file.isEmpty()) {
             throw new IllegalArgumentException("上传文件不能为空");
@@ -104,7 +112,10 @@ public class DocumentLoader {
         metadata.put("uploadedAt", Instant.now().toString());
 
         String normalizedText = normalizeText(text);
-        //拆分文档内容
+        String userIdKey = toHexKey(normalizedUserId);
+        purgeExistingResumeData(userIdKey);
+
+        //拆分文档内容作为父文档并存储
         List<ParentBlock> parentBlocks = extractParentBlocks(normalizedText);
         if (parentBlocks.isEmpty()) {
             parentBlocks = List.of(new ParentBlock("resume", normalizedText));
@@ -113,10 +124,11 @@ public class DocumentLoader {
         List<TextSegment> childSegments = new ArrayList<>();
         for (int i = 0; i < parentBlocks.size(); i++) {
             ParentBlock parentBlock = parentBlocks.get(i);
+            Long parentBlockId = saveParentBlock(normalizedUserId, userIdKey, i, parentBlock);
             Metadata parentMetadata = metadata.copy();
             parentMetadata.put("parentType", parentBlock.type());
             parentMetadata.put("parentIndex", String.valueOf(i));
-            parentMetadata.put("parentBlock", parentBlock.content());
+            parentMetadata.put("parentBlockId", String.valueOf(parentBlockId));
 
             Document parentDocument = Document.from(parentBlock.content(), parentMetadata);
             List<TextSegment> children = CHILD_SPLITTER.split(parentDocument);
@@ -325,14 +337,14 @@ public class DocumentLoader {
             Metadata metadata = segment.metadata();
             String parentIndex = metadata == null ? "" : safe(metadata.getString("parentIndex"));
             String parentType = metadata == null ? "" : safe(metadata.getString("parentType"));
-            String parentBlock = metadata == null ? "" : safe(metadata.getString("parentBlock"));
+            Long parentBlockId = parseParentBlockId(metadata == null ? "" : safe(metadata.getString("parentBlockId")));
             String fallback = safe(segment.text());
 
             String parentKey = parentIndex.isBlank() ? "fallback-" + fallback.hashCode() : parentIndex;
-            String context = parentBlock.isBlank() ? fallback : parentBlock;
+            String context = fallback;
             double score = reciprocalRank(i);
 
-            ParentCandidate incoming = new ParentCandidate(parentKey, parentType, context, score);
+            ParentCandidate incoming = new ParentCandidate(parentKey, parentType, parentBlockId, context, score);
             ParentCandidate existing = candidates.get(parentKey);
             if (existing == null || incoming.score() > existing.score()) {
                 candidates.put(parentKey, incoming);
@@ -344,24 +356,35 @@ public class DocumentLoader {
             String parentKey = hit.parentIndex().isBlank() ? "kw-" + i : hit.parentIndex();
             ParentCandidate existing = candidates.get(parentKey);
             double score = reciprocalRank(i);
+            Long keywordParentBlockId = parseParentBlockId(hit.parentBlockId());
             if (existing == null) {
-                candidates.put(parentKey, new ParentCandidate(parentKey, hit.parentType(), hit.parentBlock(), score));
+                candidates.put(parentKey, new ParentCandidate(parentKey, hit.parentType(), keywordParentBlockId, "", score));
             } else {
                 candidates.put(parentKey, new ParentCandidate(
                         existing.parentKey(),
                         existing.parentType().isBlank() ? hit.parentType() : existing.parentType(),
-                        existing.context().isBlank() ? hit.parentBlock() : existing.context(),
+                        existing.parentBlockId() == null ? keywordParentBlockId : existing.parentBlockId(),
+                        existing.context(),
                         existing.score() + score
                 ));
             }
         }
+
+        Map<Long, String> parentContentById = loadParentBlockContents(
+                candidates.values().stream()
+                        .map(ParentCandidate::parentBlockId)
+                        .filter(id -> id != null && id > 0)
+                        .toList()
+        );
 
         return candidates.values().stream()
                 .sorted(Comparator.comparingDouble(ParentCandidate::score).reversed())
                 .limit(maxParents)
                 .map(candidate -> {
                     String type = candidate.parentType().isBlank() ? "resume" : candidate.parentType();
-                    return "【parentType=" + type + ", parentIndex=" + candidate.parentKey() + "】\n" + candidate.context();
+                    String dbContent = candidate.parentBlockId() == null ? "" : safe(parentContentById.get(candidate.parentBlockId()));
+                    String content = dbContent.isBlank() ? candidate.context() : dbContent;
+                    return "【parentType=" + type + ", parentIndex=" + candidate.parentKey() + "】\n" + content;
                 })
                 .toList();
     }
@@ -376,7 +399,7 @@ public class DocumentLoader {
             String redisQuery = "@userIdKey:{" + userIdKey + "} @sourceType:{resume} @text:(" + textClause + ")";
             FTSearchParams params = FTSearchParams.searchParams()
                     .limit(0, limit)
-                    .returnFields("parentType", "parentIndex", "parentBlock")
+                    .returnFields("parentType", "parentIndex", "parentBlockId")
                     .dialect(2);
             SearchResult result = unifiedJedis.ftSearch(vectorIndexName, redisQuery, params);
             if (result == null || result.getDocuments() == null) {
@@ -384,7 +407,7 @@ public class DocumentLoader {
             }
             return result.getDocuments().stream()
                     .map(this::toKeywordHit)
-                    .filter(hit -> !hit.parentBlock().isBlank())
+                    .filter(hit -> !hit.parentBlockId().isBlank())
                     .toList();
         } catch (Exception ignored) {
             return List.of();
@@ -398,8 +421,82 @@ public class DocumentLoader {
         return new KeywordHit(
                 safe(doc.getString("parentType")),
                 safe(doc.getString("parentIndex")),
-                safe(doc.getString("parentBlock"))
+                safe(doc.getString("parentBlockId"))
         );
+    }
+
+    private Long saveParentBlock(String normalizedUserId, String userIdKey, int parentIndex, ParentBlock parentBlock) {
+        ResumeParentBlockEntity entity = new ResumeParentBlockEntity();
+        entity.setUserId(normalizedUserId);
+        entity.setUserIdKey(userIdKey);
+        entity.setSourceType(SOURCE_TYPE_RESUME);
+        entity.setParentIndex(String.valueOf(parentIndex));
+        entity.setParentType(parentBlock.type());
+        entity.setContent(parentBlock.content());
+        resumeParentBlockMapper.insert(entity);
+        if (entity.getId() == null) {
+            throw new IllegalStateException("保存父块失败，未生成主键");
+        }
+        return entity.getId();
+    }
+
+    private void purgeExistingResumeData(String userIdKey) {
+        resumeParentBlockMapper.deleteByUserIdKeyAndSourceType(userIdKey, SOURCE_TYPE_RESUME);
+        purgeRedisVectorsByUser(userIdKey);
+    }
+
+    private void purgeRedisVectorsByUser(String userIdKey) {
+        while (true) {
+            String redisQuery = "@userIdKey:{" + userIdKey + "} @sourceType:{resume}";
+            FTSearchParams params = FTSearchParams.searchParams()
+                    .limit(0, REDIS_PURGE_BATCH_SIZE)
+                    .dialect(2);
+            SearchResult result = unifiedJedis.ftSearch(vectorIndexName, redisQuery, params);
+            if (result == null || result.getDocuments() == null || result.getDocuments().isEmpty()) {
+                return;
+            }
+            List<String> redisDocIds = result.getDocuments().stream()
+                    .map(redis.clients.jedis.search.Document::getId)
+                    .filter(id -> id != null && !id.isBlank())
+                    .toList();
+            if (redisDocIds.isEmpty()) {
+                return;
+            }
+            unifiedJedis.del(redisDocIds.toArray(new String[0]));
+            if (redisDocIds.size() < REDIS_PURGE_BATCH_SIZE) {
+                return;
+            }
+        }
+    }
+
+    private Map<Long, String> loadParentBlockContents(List<Long> parentBlockIds) {
+        if (parentBlockIds == null || parentBlockIds.isEmpty()) {
+            return Map.of();
+        }
+        List<ResumeParentBlockEntity> entities = resumeParentBlockMapper.selectBatchIds(parentBlockIds);
+        if (entities == null || entities.isEmpty()) {
+            return Map.of();
+        }
+        Map<Long, String> contentById = new LinkedHashMap<>();
+        for (ResumeParentBlockEntity entity : entities) {
+            if (entity == null || entity.getId() == null) {
+                continue;
+            }
+            contentById.put(entity.getId(), safe(entity.getContent()));
+        }
+        return contentById;
+    }
+
+    private Long parseParentBlockId(String rawId) {
+        String value = safe(rawId);
+        if (value.isBlank()) {
+            return null;
+        }
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
     }
 
     private String buildRedisTextClause(String query) {
@@ -476,10 +573,10 @@ public class DocumentLoader {
     private record ParentBlock(String type, String content) {
     }
 
-    private record ParentCandidate(String parentKey, String parentType, String context, double score) {
+    private record ParentCandidate(String parentKey, String parentType, Long parentBlockId, String context, double score) {
     }
 
-    private record KeywordHit(String parentType, String parentIndex, String parentBlock) {
+    private record KeywordHit(String parentType, String parentIndex, String parentBlockId) {
     }
 
     public record UploadResult(

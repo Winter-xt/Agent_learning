@@ -84,7 +84,7 @@ public class LangChainConfig {
                         "uploadedAt", TagField.of("$.uploadedAt").as("uploadedAt"),
                         "parentType", TagField.of("$.parentType").as("parentType"),
                         "parentIndex", TagField.of("$.parentIndex").as("parentIndex"),
-                        "parentBlock", TextField.of("$.parentBlock").as("parentBlock"),
+                        "parentBlockId", TagField.of("$.parentBlockId").as("parentBlockId"),
                         "childIndex", TagField.of("$.childIndex").as("childIndex")
                 ))
                 .build();
