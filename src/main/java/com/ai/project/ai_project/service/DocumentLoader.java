@@ -4,6 +4,8 @@ import com.ai.project.ai_project.domain.ResumeParentBlockEntity;
 import com.ai.project.ai_project.mapper.ResumeParentBlockMapper;
 import com.ai.project.ai_project.util.IntentRoutingUtils;
 import com.ai.project.ai_project.util.ResumeTextUtils;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.Metadata;
@@ -20,6 +22,7 @@ import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.filter.Filter;
 import dev.langchain4j.store.embedding.filter.logical.And;
+import dev.langchain4j.store.embedding.filter.logical.Or;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
@@ -39,7 +42,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.regex.Pattern;
 
 import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
 
@@ -51,6 +53,7 @@ public class DocumentLoader {
     private static final int REDIS_PURGE_BATCH_SIZE = 200;
     private static final String PARENT_BLOCK_CACHE_KEY_PREFIX = "resume:parent:block:";
     private static final int PARENT_BLOCK_CACHE_TTL_SECONDS = 24 * 60 * 60;
+    private static final int RESUME_KEYWORD_TEXT_LIMIT = 12000;
     private static final DocumentSplitter CHILD_SPLITTER = DocumentSplitters.recursive(200, 40);
 
     private final ChatModel chatLanguageModel;
@@ -63,6 +66,8 @@ public class DocumentLoader {
     private final double vectorRecallWeight;
     private final double keywordRecallWeight;
     private final AiService intentClassifier;
+    private final ResumeMetadataFilterAiService metadataFilterAiService;
+    private final ObjectMapper objectMapper;
 
     public DocumentLoader(ChatModel chatLanguageModel,
                           EmbeddingModel embeddingModel,
@@ -71,7 +76,7 @@ public class DocumentLoader {
                           ResumeParentBlockMapper resumeParentBlockMapper,
                           @org.springframework.beans.factory.annotation.Value("${app.recall.vector-weight:1.0}") double vectorRecallWeight,
                           @org.springframework.beans.factory.annotation.Value("${app.recall.keyword-weight:1.0}") double keywordRecallWeight,
-                          @org.springframework.beans.factory.annotation.Value("${app.vector.index-name:talent-index-v2}") String vectorIndexName) {
+                          @org.springframework.beans.factory.annotation.Value("${app.vector.index-name:talent-index-v3}") String vectorIndexName) {
         this.chatLanguageModel = chatLanguageModel;
         this.embeddingModel = embeddingModel;
         this.embeddingStore = embeddingStore;
@@ -84,6 +89,10 @@ public class DocumentLoader {
         this.intentClassifier = AiServices.builder(AiService.class)
                 .chatModel(chatLanguageModel)
                 .build();
+        this.metadataFilterAiService = AiServices.builder(ResumeMetadataFilterAiService.class)
+                .chatModel(chatLanguageModel)
+                .build();
+        this.objectMapper = new ObjectMapper();
     }
 
     @Transactional(rollbackFor = Exception.class)
@@ -118,6 +127,8 @@ public class DocumentLoader {
         metadata.put("uploadedAt", Instant.now().toString());
 
         String normalizedText = ResumeTextUtils.normalizeText(text);
+        ResumeKeywordMetadata resumeKeywordCandidates = extractResumeKeywordMetadata(normalizedText);
+
         String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
         purgeExistingResumeData(userIdKey);
 
@@ -135,6 +146,7 @@ public class DocumentLoader {
             parentMetadata.put("parentType", parentBlock.type());
             parentMetadata.put("parentIndex", String.valueOf(i));
             parentMetadata.put("parentBlockId", String.valueOf(parentBlockId));
+            putResumeKeywordMetadata(parentMetadata, resolveBlockKeywordMetadata(parentBlock.content(), resumeKeywordCandidates));
 
             Document parentDocument = Document.from(parentBlock.content(), parentMetadata);
             List<TextSegment> children = CHILD_SPLITTER.split(parentDocument);
@@ -245,33 +257,29 @@ public class DocumentLoader {
 
     /**
      * 简历 RAG 检索问答：
-     * 向量召回 + Redis关键词召回混合排序，最后交给大模型基于上下文回答。
+     * 1) 先由 LLM 从问题中提取 metadata 约束；
+     * 2) 动态构建 LangChain4j Filter 并执行向量/关键词混合召回；
+     * 3) 将召回上下文交给模型生成最终答案。
      */
     private String queryResumeWithRag(String userId, String query) {
         String normalizedUserId = ResumeTextUtils.normalizeUserId(userId);
 
-        Filter filter = new And(
-                metadataKey("userIdKey").isEqualTo(ResumeTextUtils.toHexKey(normalizedUserId)),
-                metadataKey("sourceType").isEqualTo(SOURCE_TYPE_RESUME)
-        );
-
+        ResumeFilterConstraints constraints = extractResumeFilterConstraints(query);
         String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
-        EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
-                .queryEmbedding(embeddingModel.embed(query).content())
-                .maxResults(12)
-                .minScore(0.7)
-                .filter(filter)
-                .build();
+        Embedding queryEmbedding = embeddingModel.embed(query).content();
 
-        List<EmbeddingMatch<TextSegment>> vectorMatches = searchVectorMatchesWithFallback(request, userIdKey);
+        EmbeddingSearchRequest request = buildResumeSearchRequest(queryEmbedding, buildDynamicResumeFilter(normalizedUserId, constraints), 12, 0.7);
+        List<EmbeddingMatch<TextSegment>> vectorMatches = searchVectorMatchesWithFallback(request, userIdKey, constraints);
         List<KeywordHit> keywordHits = searchKeywordHits(normalizedUserId, query, 12);
-        if (vectorMatches.isEmpty() && keywordHits.isEmpty()) {
-            return "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
-        }
 
         List<String> parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, 4);
         if (parentContexts.isEmpty()) {
-            return "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
+            EmbeddingSearchRequest relaxedRequest = buildResumeSearchRequest(queryEmbedding, buildBaseResumeFilter(normalizedUserId), 12, 0.7);
+            vectorMatches = searchVectorMatchesWithFallback(relaxedRequest, userIdKey, ResumeFilterConstraints.empty());
+            parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, 4);
+            if (parentContexts.isEmpty()) {
+                return "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
+            }
         }
 
         String mergedContext = String.join("\n\n---\n\n", parentContexts);
@@ -288,6 +296,247 @@ public class DocumentLoader {
                 %s
                 """.formatted(mergedContext, query);
         return chatLanguageModel.chat(prompt);
+    }
+
+    private EmbeddingSearchRequest buildResumeSearchRequest(Embedding queryEmbedding, Filter filter, int maxResults, double minScore) {
+        return EmbeddingSearchRequest.builder()
+                .queryEmbedding(queryEmbedding)
+                .maxResults(maxResults)
+                .minScore(minScore)
+                .filter(filter)
+                .build();
+    }
+
+    /**
+     * 动态构建简历检索 Filter：
+     * - 强制约束：userIdKey/sourceType，保证只检索当前用户简历数据。
+     * - 可选约束：由 LLM 提取的 parentType/fileName/contentType/简历关键词。
+     */
+    private Filter buildDynamicResumeFilter(String normalizedUserId, ResumeFilterConstraints constraints) {
+        List<Filter> filters = new ArrayList<>();
+        filters.add(buildBaseResumeFilter(normalizedUserId));
+
+        if (!constraints.parentType().isBlank()) {
+            filters.add(metadataKey("parentType").isEqualTo(constraints.parentType()));
+        }
+        if (!constraints.fileName().isBlank()) {
+            filters.add(metadataKey("fileName").isEqualTo(constraints.fileName()));
+        }
+        if (!constraints.contentType().isBlank()) {
+            filters.add(metadataKey("contentType").isEqualTo(constraints.contentType()));
+        }
+        Filter keywordFilter = buildResumeKeywordFilter(constraints);
+        if (keywordFilter != null) {
+            filters.add(keywordFilter);
+        }
+
+        return mergeWithAnd(filters);
+    }
+
+    private Filter buildBaseResumeFilter(String normalizedUserId) {
+        return new And(
+                metadataKey("userIdKey").isEqualTo(ResumeTextUtils.toHexKey(normalizedUserId)),
+                metadataKey("sourceType").isEqualTo(SOURCE_TYPE_RESUME)
+        );
+    }
+
+    /**
+     * 将问题中提到的关键词映射到上传简历时写入的 metadata 字段。
+     * 同一关键词可命中分类字段或聚合字段；多个关键词之间使用 AND，避免把条件放得太宽。
+     */
+    private Filter buildResumeKeywordFilter(ResumeFilterConstraints constraints) {
+        List<Filter> requiredKeywordFilters = new ArrayList<>();
+        addKeywordFilters(requiredKeywordFilters, constraints.skills(), "skillKeywords");
+        addKeywordFilters(requiredKeywordFilters, constraints.companies(), "companyKeywords");
+        addKeywordFilters(requiredKeywordFilters, constraints.schools(), "schoolKeywords");
+        addKeywordFilters(requiredKeywordFilters, constraints.titles(), "titleKeywords");
+        addKeywordFilters(requiredKeywordFilters, constraints.projects(), "projectKeywords");
+        addKeywordFilters(requiredKeywordFilters, constraints.industries(), "industryKeywords");
+        addKeywordFilters(requiredKeywordFilters, constraints.keywords(), "resumeKeywords");
+        return requiredKeywordFilters.isEmpty() ? null : mergeWithAnd(requiredKeywordFilters);
+    }
+
+    private void addKeywordFilters(List<Filter> target, List<String> keywords, String metadataField) {
+        if (keywords == null || keywords.isEmpty()) {
+            return;
+        }
+        for (String rawKeyword : keywords) {
+            String keyword = normalizeKeyword(rawKeyword);
+            if (keyword.isBlank()) {
+                continue;
+            }
+            Filter categoryFilter = metadataKey(metadataField).isIn(keyword);
+            if (!"resumeKeywords".equals(metadataField)) {
+                categoryFilter = new Or(categoryFilter, metadataKey("resumeKeywords").isIn(keyword));
+            }
+            target.add(categoryFilter);
+        }
+    }
+
+    /**
+     * 由于当前 LangChain4j 版本的 And 仅支持二元构造，
+     * 这里将多个过滤条件折叠为嵌套 And。
+     */
+    private Filter mergeWithAnd(List<Filter> filters) {
+        Filter merged = filters.get(0);
+        for (int i = 1; i < filters.size(); i++) {
+            merged = new And(merged, filters.get(i));
+        }
+        return merged;
+    }
+
+    /**
+     * 调用 LLM 提取结构化约束，并做白名单清洗，避免模型输出污染检索条件。
+     */
+    private ResumeFilterConstraints extractResumeFilterConstraints(String query) {
+        try {
+            String json = metadataFilterAiService.extract(query);
+            JsonNode node = objectMapper.readTree(json);
+            String parentType = normalizeParentType(node.path("parentType").asText(""));
+            String fileName = ResumeTextUtils.safe(node.path("fileName").asText(""));
+            String contentType = ResumeTextUtils.safe(node.path("contentType").asText(""));
+            return new ResumeFilterConstraints(
+                    parentType,
+                    fileName,
+                    contentType,
+                    readKeywordArray(node, "skills"),
+                    readKeywordArray(node, "companies"),
+                    readKeywordArray(node, "schools"),
+                    readKeywordArray(node, "titles"),
+                    readKeywordArray(node, "projects"),
+                    readKeywordArray(node, "industries"),
+                    readKeywordArray(node, "keywords")
+            );
+        } catch (Exception ignored) {
+            return ResumeFilterConstraints.empty();
+        }
+    }
+
+    private ResumeKeywordMetadata extractResumeKeywordMetadata(String normalizedText) {
+        try {
+            String textForLlm = normalizedText.length() <= RESUME_KEYWORD_TEXT_LIMIT
+                    ? normalizedText
+                    : normalizedText.substring(0, RESUME_KEYWORD_TEXT_LIMIT);
+            String json = metadataFilterAiService.extractResumeKeywords(textForLlm);
+            JsonNode node = objectMapper.readTree(json);
+            return new ResumeKeywordMetadata(
+                    readKeywordArray(node, "skills"),
+                    readKeywordArray(node, "companies"),
+                    readKeywordArray(node, "schools"),
+                    readKeywordArray(node, "titles"),
+                    readKeywordArray(node, "projects"),
+                    readKeywordArray(node, "industries"),
+                    readKeywordArray(node, "keywords")
+            );
+        } catch (Exception ignored) {
+            return ResumeKeywordMetadata.empty();
+        }
+    }
+
+    private ResumeKeywordMetadata resolveBlockKeywordMetadata(String blockContent, ResumeKeywordMetadata resumeKeywordCandidates) {
+        return new ResumeKeywordMetadata(
+                keepKeywordsAppearingInBlock(blockContent, resumeKeywordCandidates.skills()),
+                keepKeywordsAppearingInBlock(blockContent, resumeKeywordCandidates.companies()),
+                keepKeywordsAppearingInBlock(blockContent, resumeKeywordCandidates.schools()),
+                keepKeywordsAppearingInBlock(blockContent, resumeKeywordCandidates.titles()),
+                keepKeywordsAppearingInBlock(blockContent, resumeKeywordCandidates.projects()),
+                keepKeywordsAppearingInBlock(blockContent, resumeKeywordCandidates.industries()),
+                keepKeywordsAppearingInBlock(blockContent, resumeKeywordCandidates.keywords())
+        );
+    }
+
+    private List<String> keepKeywordsAppearingInBlock(String blockContent, List<String> candidates) {
+        if (blockContent == null || blockContent.isBlank() || candidates == null || candidates.isEmpty()) {
+            return List.of();
+        }
+        String normalizedBlock = normalizeKeywordMatchText(blockContent);
+        Set<String> matched = new LinkedHashSet<>();
+        for (String candidate : candidates) {
+            String keyword = normalizeKeyword(candidate);
+            if (!keyword.isBlank() && normalizedBlock.contains(normalizeKeywordMatchText(keyword))) {
+                matched.add(keyword);
+            }
+        }
+        return List.copyOf(matched);
+    }
+
+    private void putResumeKeywordMetadata(Metadata metadata, ResumeKeywordMetadata keywordMetadata) {
+        metadata.put("skillKeywords", joinKeywords(keywordMetadata.skills()));
+        metadata.put("companyKeywords", joinKeywords(keywordMetadata.companies()));
+        metadata.put("schoolKeywords", joinKeywords(keywordMetadata.schools()));
+        metadata.put("titleKeywords", joinKeywords(keywordMetadata.titles()));
+        metadata.put("projectKeywords", joinKeywords(keywordMetadata.projects()));
+        metadata.put("industryKeywords", joinKeywords(keywordMetadata.industries()));
+
+        List<String> allKeywords = new ArrayList<>();
+        allKeywords.addAll(keywordMetadata.skills());
+        allKeywords.addAll(keywordMetadata.companies());
+        allKeywords.addAll(keywordMetadata.schools());
+        allKeywords.addAll(keywordMetadata.titles());
+        allKeywords.addAll(keywordMetadata.projects());
+        allKeywords.addAll(keywordMetadata.industries());
+        allKeywords.addAll(keywordMetadata.keywords());
+        metadata.put("resumeKeywords", joinKeywords(allKeywords));
+    }
+
+    private List<String> readKeywordArray(JsonNode node, String fieldName) {
+        JsonNode arrayNode = node.path(fieldName);
+        if (!arrayNode.isArray()) {
+            return List.of();
+        }
+        Set<String> keywords = new LinkedHashSet<>();
+        for (JsonNode item : arrayNode) {
+            String keyword = normalizeKeyword(item.asText(""));
+            if (!keyword.isBlank()) {
+                keywords.add(keyword);
+            }
+            if (keywords.size() >= 20) {
+                break;
+            }
+        }
+        return List.copyOf(keywords);
+    }
+
+    private String joinKeywords(List<String> keywords) {
+        if (keywords == null || keywords.isEmpty()) {
+            return "";
+        }
+        Set<String> normalized = new LinkedHashSet<>();
+        for (String keyword : keywords) {
+            String value = normalizeKeyword(keyword);
+            if (!value.isBlank()) {
+                normalized.add(value);
+            }
+        }
+        return String.join(" ", normalized);
+    }
+
+    private String normalizeKeywordMatchText(String raw) {
+        return ResumeTextUtils.safe(raw)
+                .toLowerCase(Locale.ROOT)
+                .replaceAll("\\s+", "");
+    }
+
+    private String normalizeKeyword(String raw) {
+        String value = ResumeTextUtils.safe(raw)
+                .replaceAll("[\\r\\n\\t]+", " ")
+                .replaceAll("\\s{2,}", " ")
+                .trim();
+        if (value.length() > 30) {
+            value = value.substring(0, 30).trim();
+        }
+        return value;
+    }
+
+    /**
+     * parentType 白名单：仅允许 project/resume，其他值全部清空。
+     */
+    private String normalizeParentType(String raw) {
+        String value = ResumeTextUtils.safe(raw).toLowerCase(Locale.ROOT);
+        if ("project".equals(value) || "resume".equals(value)) {
+            return value;
+        }
+        return "";
     }
 
     private void validateResumeQueryParams(String userId, String query) {
@@ -309,10 +558,15 @@ public class DocumentLoader {
     }
 
     private List<EmbeddingMatch<TextSegment>> searchVectorMatchesWithFallback(EmbeddingSearchRequest request,
-                                                                               String userIdKey) {
-        List<EmbeddingMatch<TextSegment>> primary = embeddingStore.search(request).matches();
-        if (!primary.isEmpty()) {
-            return primary;
+                                                                               String userIdKey,
+                                                                               ResumeFilterConstraints constraints) {
+        try {
+            List<EmbeddingMatch<TextSegment>> primary = embeddingStore.search(request).matches();
+            if (!primary.isEmpty()) {
+                return primary;
+            }
+        } catch (Exception ignored) {
+            // Fall back to an unfiltered vector search and apply supported filters in memory.
         }
 
         // Fallback for schema/version drift: retrieve without filter and apply metadata filtering in JVM.
@@ -323,10 +577,64 @@ public class DocumentLoader {
                 .build();
         return embeddingStore.search(fallbackRequest).matches().stream()
                 .filter(match -> match.embedded() != null && match.embedded().metadata() != null)
-                .filter(match -> SOURCE_TYPE_RESUME.equals(ResumeTextUtils.safe(match.embedded().metadata().getString("sourceType"))))
-                .filter(match -> userIdKey.equals(ResumeTextUtils.safe(match.embedded().metadata().getString("userIdKey"))))
+                .filter(match -> metadataMatchesResumeFilter(match.embedded().metadata(), userIdKey, constraints))
                 .limit(12)
                 .toList();
+    }
+
+    private boolean metadataMatchesResumeFilter(Metadata metadata, String userIdKey, ResumeFilterConstraints constraints) {
+        if (metadata == null) {
+            return false;
+        }
+        if (!SOURCE_TYPE_RESUME.equals(ResumeTextUtils.safe(metadata.getString("sourceType")))) {
+            return false;
+        }
+        if (!userIdKey.equals(ResumeTextUtils.safe(metadata.getString("userIdKey")))) {
+            return false;
+        }
+        if (!constraints.parentType().isBlank()
+                && !constraints.parentType().equals(ResumeTextUtils.safe(metadata.getString("parentType")))) {
+            return false;
+        }
+        if (!constraints.fileName().isBlank()
+                && !constraints.fileName().equals(ResumeTextUtils.safe(metadata.getString("fileName")))) {
+            return false;
+        }
+        if (!constraints.contentType().isBlank()
+                && !constraints.contentType().equals(ResumeTextUtils.safe(metadata.getString("contentType")))) {
+            return false;
+        }
+        return metadataMatchesKeywords(metadata, constraints);
+    }
+
+    private boolean metadataMatchesKeywords(Metadata metadata, ResumeFilterConstraints constraints) {
+        return metadataMatchesKeywords(metadata, constraints.skills(), "skillKeywords")
+                && metadataMatchesKeywords(metadata, constraints.companies(), "companyKeywords")
+                && metadataMatchesKeywords(metadata, constraints.schools(), "schoolKeywords")
+                && metadataMatchesKeywords(metadata, constraints.titles(), "titleKeywords")
+                && metadataMatchesKeywords(metadata, constraints.projects(), "projectKeywords")
+                && metadataMatchesKeywords(metadata, constraints.industries(), "industryKeywords")
+                && metadataMatchesKeywords(metadata, constraints.keywords(), "resumeKeywords");
+    }
+
+    private boolean metadataMatchesKeywords(Metadata metadata, List<String> keywords, String metadataField) {
+        if (keywords == null || keywords.isEmpty()) {
+            return true;
+        }
+        String fieldValue = normalizeKeywordMatchText(metadata.getString(metadataField));
+        String resumeValue = "resumeKeywords".equals(metadataField)
+                ? fieldValue
+                : normalizeKeywordMatchText(metadata.getString("resumeKeywords"));
+        for (String rawKeyword : keywords) {
+            String keyword = normalizeKeywordMatchText(rawKeyword);
+            if (keyword.isBlank()) {
+                continue;
+            }
+            if (!fieldValue.contains(keyword) && !resumeValue.contains(keyword)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -562,6 +870,62 @@ public class DocumentLoader {
     }
 
     private record KeywordHit(String parentType, String parentIndex, String parentBlockId) {
+    }
+
+    /**
+     * LLM 提取后的可用 metadata 约束。
+     */
+    private record ResumeFilterConstraints(
+            String parentType,
+            String fileName,
+            String contentType,
+            List<String> skills,
+            List<String> companies,
+            List<String> schools,
+            List<String> titles,
+            List<String> projects,
+            List<String> industries,
+            List<String> keywords
+    ) {
+        private static ResumeFilterConstraints empty() {
+            return new ResumeFilterConstraints(
+                    "",
+                    "",
+                    "",
+                    List.of(),
+                    List.of(),
+                    List.of(),
+                    List.of(),
+                    List.of(),
+                    List.of(),
+                    List.of()
+            );
+        }
+    }
+
+    /**
+     * 上传简历时由 LLM 读取简历后抽取出的可检索 metadata 关键词。
+     */
+    private record ResumeKeywordMetadata(
+            List<String> skills,
+            List<String> companies,
+            List<String> schools,
+            List<String> titles,
+            List<String> projects,
+            List<String> industries,
+            List<String> keywords
+    ) {
+        private static ResumeKeywordMetadata empty() {
+            return new ResumeKeywordMetadata(
+                    List.of(),
+                    List.of(),
+                    List.of(),
+                    List.of(),
+                    List.of(),
+                    List.of(),
+                    List.of()
+            );
+        }
     }
 
     public record UploadResult(

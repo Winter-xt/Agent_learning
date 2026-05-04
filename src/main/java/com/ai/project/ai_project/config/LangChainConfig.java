@@ -46,10 +46,10 @@ public class LangChainConfig {
     @Value("${spring.data.redis.port:6379}")
     private int redisPort;
 
-    @Value("${app.vector.index-name:talent-index-v2}")
+    @Value("${app.vector.index-name:talent-index-v3}")
     private String vectorIndexName;
 
-    @Value("${app.vector.prefix:talent:v2:}")
+    @Value("${app.vector.prefix:talent:v3:}")
     private String vectorPrefix;
 
     @Bean
@@ -75,17 +75,24 @@ public class LangChainConfig {
                 .dimension(384)
                 .indexName(vectorIndexName)
                 .prefix(vectorPrefix)
-                .metadataConfig(Map.of(
-                        "userIdKey", TagField.of("$.userIdKey").as("userIdKey"),
-                        "sourceType", TagField.of("$.sourceType").as("sourceType"),
-                        "userId", TagField.of("$.userId").as("userId"),
-                        "fileName", TextField.of("$.fileName").as("fileName"),
-                        "contentType", TagField.of("$.contentType").as("contentType"),
-                        "uploadedAt", TagField.of("$.uploadedAt").as("uploadedAt"),
-                        "parentType", TagField.of("$.parentType").as("parentType"),
-                        "parentIndex", TagField.of("$.parentIndex").as("parentIndex"),
-                        "parentBlockId", TagField.of("$.parentBlockId").as("parentBlockId"),
-                        "childIndex", TagField.of("$.childIndex").as("childIndex")
+                .metadataConfig(Map.ofEntries(
+                        Map.entry("userIdKey", TagField.of("$.userIdKey").as("userIdKey")),
+                        Map.entry("sourceType", TagField.of("$.sourceType").as("sourceType")),
+                        Map.entry("userId", TagField.of("$.userId").as("userId")),
+                        Map.entry("fileName", TextField.of("$.fileName").as("fileName")),
+                        Map.entry("contentType", TagField.of("$.contentType").as("contentType")),
+                        Map.entry("uploadedAt", TagField.of("$.uploadedAt").as("uploadedAt")),
+                        Map.entry("parentType", TagField.of("$.parentType").as("parentType")),
+                        Map.entry("parentIndex", TagField.of("$.parentIndex").as("parentIndex")),
+                        Map.entry("parentBlockId", TagField.of("$.parentBlockId").as("parentBlockId")),
+                        Map.entry("childIndex", TagField.of("$.childIndex").as("childIndex")),
+                        Map.entry("resumeKeywords", TextField.of("$.resumeKeywords").as("resumeKeywords")),
+                        Map.entry("skillKeywords", TextField.of("$.skillKeywords").as("skillKeywords")),
+                        Map.entry("companyKeywords", TextField.of("$.companyKeywords").as("companyKeywords")),
+                        Map.entry("schoolKeywords", TextField.of("$.schoolKeywords").as("schoolKeywords")),
+                        Map.entry("titleKeywords", TextField.of("$.titleKeywords").as("titleKeywords")),
+                        Map.entry("projectKeywords", TextField.of("$.projectKeywords").as("projectKeywords")),
+                        Map.entry("industryKeywords", TextField.of("$.industryKeywords").as("industryKeywords"))
                 ))
                 .build();
     }
