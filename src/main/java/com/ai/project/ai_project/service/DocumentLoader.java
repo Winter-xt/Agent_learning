@@ -55,6 +55,18 @@ public class DocumentLoader {
     private static final int PARENT_BLOCK_CACHE_TTL_SECONDS = 24 * 60 * 60;
     private static final int RESUME_KEYWORD_TEXT_LIMIT = 12000;
     private static final DocumentSplitter CHILD_SPLITTER = DocumentSplitters.recursive(200, 40);
+    private static final Set<String> FAMOUS_SCHOOL_SIGNALS = Set.of(
+            "985", "211", "双一流", "c9", "清华", "北大", "北京大学", "复旦", "上海交通大学", "上海交大",
+            "浙江大学", "浙大", "中国科学技术大学", "中科大", "南京大学", "南大", "哈尔滨工业大学", "哈工大",
+            "西安交通大学", "西安交大", "中国人民大学", "人大", "同济大学", "北京航空航天大学", "北航",
+            "北京理工大学", "北理工", "南开大学", "天津大学", "武汉大学", "华中科技大学", "中山大学",
+            "厦门大学", "东南大学"
+    );
+    private static final Set<String> BIG_COMPANY_SIGNALS = Set.of(
+            "阿里", "淘宝", "天猫", "腾讯", "微信", "字节", "抖音", "快手", "美团", "京东", "百度", "网易",
+            "拼多多", "小米", "华为", "滴滴", "蚂蚁", "shopee", "google", "meta", "facebook", "amazon",
+            "microsoft", "apple", "netflix"
+    );
 
     private final ChatModel chatLanguageModel;
     private final EmbeddingModel embeddingModel;
@@ -238,6 +250,7 @@ public class DocumentLoader {
     public String queryResume(String userId, String query) {
         validateResumeQueryParams(userId, query);
 
+        //意图识别，判断用户的问题是否需要 RAG
         Intent intent = classifyIntent(query);
         if (shouldUseResumeRag(intent)) {
             return queryResumeWithRag(userId, query);
@@ -264,12 +277,15 @@ public class DocumentLoader {
     private String queryResumeWithRag(String userId, String query) {
         String normalizedUserId = ResumeTextUtils.normalizeUserId(userId);
 
+        //提取约束条件
         ResumeFilterConstraints constraints = extractResumeFilterConstraints(query);
         String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
         Embedding queryEmbedding = embeddingModel.embed(query).content();
 
         EmbeddingSearchRequest request = buildResumeSearchRequest(queryEmbedding, buildDynamicResumeFilter(normalizedUserId, constraints), 12, 0.7);
+        //向量召回
         List<EmbeddingMatch<TextSegment>> vectorMatches = searchVectorMatchesWithFallback(request, userIdKey, constraints);
+        //关键字召回
         List<KeywordHit> keywordHits = searchKeywordHits(normalizedUserId, query, 12);
 
         List<String> parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, 4);
@@ -453,11 +469,36 @@ public class DocumentLoader {
         Set<String> matched = new LinkedHashSet<>();
         for (String candidate : candidates) {
             String keyword = normalizeKeyword(candidate);
-            if (!keyword.isBlank() && normalizedBlock.contains(normalizeKeywordMatchText(keyword))) {
+            if (!keyword.isBlank()
+                    && (normalizedBlock.contains(normalizeKeywordMatchText(keyword))
+                    || semanticKeywordAppearsInBlock(keyword, normalizedBlock))) {
                 matched.add(keyword);
             }
         }
         return List.copyOf(matched);
+    }
+
+    private boolean semanticKeywordAppearsInBlock(String keyword, String normalizedBlock) {
+        String normalizedKeyword = normalizeKeywordMatchText(keyword);
+        if ("名校".equals(normalizedKeyword)) {
+            return containsAnyNormalized(normalizedBlock, FAMOUS_SCHOOL_SIGNALS);
+        }
+        if ("大厂".equals(normalizedKeyword)) {
+            return containsAnyNormalized(normalizedBlock, BIG_COMPANY_SIGNALS);
+        }
+        return false;
+    }
+
+    private boolean containsAnyNormalized(String normalizedText, Set<String> signals) {
+        if (normalizedText == null || normalizedText.isBlank() || signals == null || signals.isEmpty()) {
+            return false;
+        }
+        for (String signal : signals) {
+            if (normalizedText.contains(normalizeKeywordMatchText(signal))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void putResumeKeywordMetadata(Metadata metadata, ResumeKeywordMetadata keywordMetadata) {
