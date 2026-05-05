@@ -1,6 +1,8 @@
 package com.ai.project.ai_project.service;
 
+import com.ai.project.ai_project.domain.ResumeDocumentEntity;
 import com.ai.project.ai_project.domain.ResumeParentBlockEntity;
+import com.ai.project.ai_project.mapper.ResumeDocumentMapper;
 import com.ai.project.ai_project.mapper.ResumeParentBlockMapper;
 import com.ai.project.ai_project.util.IntentRoutingUtils;
 import com.ai.project.ai_project.util.ResumeTextUtils;
@@ -30,10 +32,15 @@ import redis.clients.jedis.UnifiedJedis;
 import redis.clients.jedis.search.FTSearchParams;
 import redis.clients.jedis.search.SearchResult;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -42,6 +49,9 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
 
@@ -51,6 +61,7 @@ public class DocumentLoader {
     private static final Set<String> SUPPORTED_EXTENSIONS = Set.of("pdf", "doc", "docx");
     private static final String SOURCE_TYPE_RESUME = "resume";
     private static final int REDIS_PURGE_BATCH_SIZE = 200;
+    private static final int ZIP_ENTRY_READ_BUFFER_SIZE = 8192;
     private static final String PARENT_BLOCK_CACHE_KEY_PREFIX = "resume:parent:block:";
     private static final int PARENT_BLOCK_CACHE_TTL_SECONDS = 24 * 60 * 60;
     private static final int RESUME_KEYWORD_TEXT_LIMIT = 12000;
@@ -73,8 +84,10 @@ public class DocumentLoader {
     private final EmbeddingStore<TextSegment> embeddingStore;
     private final UnifiedJedis unifiedJedis;
     private final ResumeParentBlockMapper resumeParentBlockMapper;
+    private final ResumeDocumentMapper resumeDocumentMapper;
     private final ApacheTikaDocumentParser parser;
     private final String vectorIndexName;
+    private final Path resumeStorageDir;
     private final double vectorRecallWeight;
     private final double keywordRecallWeight;
     private final AiService intentClassifier;
@@ -86,18 +99,22 @@ public class DocumentLoader {
                           EmbeddingStore<TextSegment> embeddingStore,
                           UnifiedJedis unifiedJedis,
                           ResumeParentBlockMapper resumeParentBlockMapper,
+                          ResumeDocumentMapper resumeDocumentMapper,
                           @org.springframework.beans.factory.annotation.Value("${app.recall.vector-weight:1.0}") double vectorRecallWeight,
                           @org.springframework.beans.factory.annotation.Value("${app.recall.keyword-weight:1.0}") double keywordRecallWeight,
-                          @org.springframework.beans.factory.annotation.Value("${app.vector.index-name:talent-index-v3}") String vectorIndexName) {
+                          @org.springframework.beans.factory.annotation.Value("${app.vector.index-name:talent-index-v4}") String vectorIndexName,
+                          @org.springframework.beans.factory.annotation.Value("${app.resume.storage-dir:${user.home}/.ai_project/resumes}") String resumeStorageDir) {
         this.chatLanguageModel = chatLanguageModel;
         this.embeddingModel = embeddingModel;
         this.embeddingStore = embeddingStore;
         this.unifiedJedis = unifiedJedis;
         this.resumeParentBlockMapper = resumeParentBlockMapper;
+        this.resumeDocumentMapper = resumeDocumentMapper;
         this.parser = new ApacheTikaDocumentParser();
         this.vectorRecallWeight = vectorRecallWeight;
         this.keywordRecallWeight = keywordRecallWeight;
         this.vectorIndexName = vectorIndexName;
+        this.resumeStorageDir = Path.of(resumeStorageDir);
         this.intentClassifier = AiServices.builder(AiService.class)
                 .chatModel(chatLanguageModel)
                 .build();
@@ -114,46 +131,100 @@ public class DocumentLoader {
         }
 
         String normalizedUserId = ResumeTextUtils.normalizeUserId(userId);
-
         String fileName = file.getOriginalFilename();
         validateExtension(fileName);
-
-        Document parsedDocument;
-        try (InputStream inputStream = file.getInputStream()) {
-            parsedDocument = parser.parse(inputStream);
+        ParsedResume parsedResume = parseResumeFile(fileName, file.getContentType(), file.getBytes());
+        if (!parsedResume.profile().isResume()) {
+            throw new IllegalArgumentException("上传文件不是候选人简历");
         }
 
+        String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
+        purgeExistingResumeData(userIdKey);
+        return persistParsedResume(normalizedUserId, userIdKey, parsedResume);
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public BatchUploadResult loadResumes(String userId, MultipartFile[] files) throws IOException {
+        if (files == null || files.length == 0) {
+            throw new IllegalArgumentException("上传文件不能为空");
+        }
+
+        String normalizedUserId = ResumeTextUtils.normalizeUserId(userId);
+        String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
+        List<UploadedResumeFile> uploadedFiles = new ArrayList<>();
+        for (MultipartFile file : files) {
+            if (file == null || file.isEmpty()) {
+                continue;
+            }
+            uploadedFiles.addAll(expandUploadFile(file));
+        }
+
+        List<UploadResult> uploaded = new ArrayList<>();
+        List<SkippedUpload> skipped = new ArrayList<>();
+        for (UploadedResumeFile uploadedFile : uploadedFiles) {
+            try {
+                validateExtension(uploadedFile.fileName());
+                ParsedResume parsedResume = parseResumeFile(uploadedFile.fileName(), uploadedFile.contentType(), uploadedFile.bytes());
+                if (!parsedResume.profile().isResume()) {
+                    skipped.add(new SkippedUpload(uploadedFile.fileName(), "不是候选人简历"));
+                    continue;
+                }
+                uploaded.add(persistParsedResume(normalizedUserId, userIdKey, parsedResume));
+            } catch (IllegalArgumentException e) {
+                skipped.add(new SkippedUpload(uploadedFile.fileName(), e.getMessage()));
+            } catch (Exception e) {
+                skipped.add(new SkippedUpload(uploadedFile.fileName(), "解析或入库失败"));
+            }
+        }
+
+        return new BatchUploadResult(normalizedUserId, uploaded, skipped);
+    }
+
+    private ParsedResume parseResumeFile(String fileName, String contentType, byte[] bytes) throws IOException {
+        Document parsedDocument;
+        try (InputStream inputStream = new ByteArrayInputStream(bytes)) {
+            parsedDocument = parser.parse(inputStream);
+        }
         String text = parsedDocument.text();
         if (text == null || text.isBlank()) {
             throw new IllegalArgumentException("文档内容为空，无法入库");
         }
 
+        String normalizedText = ResumeTextUtils.normalizeText(text);
+        ResumeProfile profile = extractResumeProfile(normalizedText);
+        return new ParsedResume(fileName, contentType, bytes, parsedDocument, normalizedText, profile);
+    }
+
+    private UploadResult persistParsedResume(String normalizedUserId, String userIdKey, ParsedResume parsedResume) throws IOException {
+        Document parsedDocument = parsedResume.document();
         Metadata metadata = parsedDocument.metadata() == null
                 ? new Metadata()
                 : parsedDocument.metadata().copy();
+        ResumeDocumentEntity resumeDocument = createResumeDocument(normalizedUserId, userIdKey, parsedResume);
+        String storedPath = storeOriginalResumeFile(userIdKey, resumeDocument.getId(), parsedResume.fileName(), parsedResume.bytes());
+        resumeDocument.setStoredFilePath(storedPath);
+        resumeDocumentMapper.updateById(resumeDocument);
+
         metadata.put("userId", normalizedUserId);
         metadata.put("userIdKey", ResumeTextUtils.toHexKey(normalizedUserId));
         metadata.put("sourceType", SOURCE_TYPE_RESUME);
-        metadata.put("fileName", fileName == null ? "" : fileName);
-        metadata.put("contentType", file.getContentType() == null ? "" : file.getContentType());
+        metadata.put("resumeId", String.valueOf(resumeDocument.getId()));
+        metadata.put("candidateName", resumeDocument.getCandidateName());
+        metadata.put("fileName", parsedResume.fileName() == null ? "" : parsedResume.fileName());
+        metadata.put("contentType", parsedResume.contentType() == null ? "" : parsedResume.contentType());
         metadata.put("uploadedAt", Instant.now().toString());
 
-        String normalizedText = ResumeTextUtils.normalizeText(text);
-        ResumeKeywordMetadata resumeKeywordCandidates = extractResumeKeywordMetadata(normalizedText);
-
-        String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
-        purgeExistingResumeData(userIdKey);
-
         //拆分文档内容作为父文档并存储
-        List<ParentBlock> parentBlocks = extractParentBlocks(normalizedText);
+        List<ParentBlock> parentBlocks = extractParentBlocks(parsedResume.normalizedText());
         if (parentBlocks.isEmpty()) {
-            parentBlocks = List.of(new ParentBlock("resume", normalizedText));
+            parentBlocks = List.of(new ParentBlock("resume", parsedResume.normalizedText()));
         }
 
+        ResumeKeywordMetadata resumeKeywordCandidates = extractResumeKeywordMetadata(parsedResume.normalizedText());
         List<TextSegment> childSegments = new ArrayList<>();
         for (int i = 0; i < parentBlocks.size(); i++) {
             ParentBlock parentBlock = parentBlocks.get(i);
-            Long parentBlockId = saveParentBlock(normalizedUserId, userIdKey, i, parentBlock);
+            Long parentBlockId = saveParentBlock(normalizedUserId, userIdKey, resumeDocument.getId(), i, parentBlock);
             Metadata parentMetadata = metadata.copy();
             parentMetadata.put("parentType", parentBlock.type());
             parentMetadata.put("parentIndex", String.valueOf(i));
@@ -179,12 +250,16 @@ public class DocumentLoader {
 
         Response<List<Embedding>> response = embeddingModel.embedAll(childSegments);
         embeddingStore.addAll(response.content(), childSegments);
+        resumeDocument.setSegmentCount(childSegments.size());
+        resumeDocumentMapper.updateById(resumeDocument);
 
         return new UploadResult(
                 normalizedUserId,
-                fileName == null ? "" : fileName,
+                resumeDocument.getId(),
+                resumeDocument.getCandidateName(),
+                parsedResume.fileName() == null ? "" : parsedResume.fileName(),
                 childSegments.size(),
-                text.length(),
+                parsedResume.normalizedText().length(),
                 response.tokenUsage() == null ? null : response.tokenUsage().totalTokenCount()
         );
     }
@@ -243,6 +318,124 @@ public class DocumentLoader {
         }
     }
 
+    private List<UploadedResumeFile> expandUploadFile(MultipartFile file) throws IOException {
+        String fileName = file.getOriginalFilename() == null ? "" : file.getOriginalFilename();
+        if (!isZipFile(fileName, file.getContentType())) {
+            return List.of(new UploadedResumeFile(fileName, file.getContentType(), file.getBytes()));
+        }
+
+        List<UploadedResumeFile> expanded = new ArrayList<>();
+        try (ZipInputStream zipInputStream = new ZipInputStream(file.getInputStream(), StandardCharsets.UTF_8)) {
+            ZipEntry entry;
+            while ((entry = zipInputStream.getNextEntry()) != null) {
+                if (entry.isDirectory()) {
+                    continue;
+                }
+                String entryFileName = sanitizeFileName(entry.getName());
+                if (entryFileName.isBlank()) {
+                    continue;
+                }
+                expanded.add(new UploadedResumeFile(entryFileName, "application/octet-stream", readZipEntryBytes(zipInputStream)));
+            }
+        }
+        return expanded;
+    }
+
+    private byte[] readZipEntryBytes(ZipInputStream zipInputStream) throws IOException {
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        byte[] buffer = new byte[ZIP_ENTRY_READ_BUFFER_SIZE];
+        int read;
+        while ((read = zipInputStream.read(buffer)) >= 0) {
+            outputStream.write(buffer, 0, read);
+        }
+        return outputStream.toByteArray();
+    }
+
+    private boolean isZipFile(String fileName, String contentType) {
+        String normalizedFileName = ResumeTextUtils.safe(fileName).toLowerCase(Locale.ROOT);
+        String normalizedContentType = ResumeTextUtils.safe(contentType).toLowerCase(Locale.ROOT);
+        return normalizedFileName.endsWith(".zip") || normalizedContentType.contains("zip");
+    }
+
+    private ResumeProfile extractResumeProfile(String normalizedText) {
+        try {
+            String textForLlm = normalizedText.length() <= RESUME_KEYWORD_TEXT_LIMIT
+                    ? normalizedText
+                    : normalizedText.substring(0, RESUME_KEYWORD_TEXT_LIMIT);
+            String json = metadataFilterAiService.extractResumeProfile(textForLlm);
+            JsonNode node = objectMapper.readTree(json);
+            boolean isResume = node.path("isResume").asBoolean(false);
+            String candidateName = normalizeKeyword(node.path("candidateName").asText(""));
+            return new ResumeProfile(isResume, candidateName);
+        } catch (Exception ignored) {
+            boolean looksLikeResume = containsAnyText(normalizedText, "教育经历", "工作经历", "项目经历", "专业技能", "技能栈", "个人信息");
+            return new ResumeProfile(looksLikeResume, "");
+        }
+    }
+
+    private boolean containsAnyText(String text, String... keywords) {
+        if (text == null || text.isBlank()) {
+            return false;
+        }
+        for (String keyword : keywords) {
+            if (text.contains(keyword)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private ResumeDocumentEntity createResumeDocument(String normalizedUserId,
+                                                      String userIdKey,
+                                                      ParsedResume parsedResume) {
+        ResumeDocumentEntity entity = new ResumeDocumentEntity();
+        entity.setUserId(normalizedUserId);
+        entity.setUserIdKey(userIdKey);
+        entity.setSourceType(SOURCE_TYPE_RESUME);
+        entity.setCandidateName(resolveCandidateName(parsedResume.profile().candidateName(), parsedResume.fileName()));
+        entity.setOriginalFileName(parsedResume.fileName() == null ? "" : parsedResume.fileName());
+        entity.setStoredFilePath("");
+        entity.setContentType(parsedResume.contentType() == null ? "" : parsedResume.contentType());
+        entity.setFileSize((long) parsedResume.bytes().length);
+        entity.setSegmentCount(0);
+        entity.setCharacterCount(parsedResume.normalizedText().length());
+        entity.setUploadedAt(LocalDateTime.now());
+        resumeDocumentMapper.insert(entity);
+        if (entity.getId() == null) {
+            throw new IllegalStateException("保存简历主信息失败，未生成主键");
+        }
+        return entity;
+    }
+
+    private String resolveCandidateName(String candidateName, String fileName) {
+        String normalized = normalizeKeyword(candidateName);
+        if (!normalized.isBlank()) {
+            return normalized;
+        }
+        String sanitized = sanitizeFileName(fileName);
+        int dotIndex = sanitized.lastIndexOf('.');
+        return dotIndex > 0 ? sanitized.substring(0, dotIndex) : sanitized;
+    }
+
+    private String storeOriginalResumeFile(String userIdKey, Long resumeId, String fileName, byte[] bytes) throws IOException {
+        Path directory = resumeStorageDir.resolve(userIdKey).resolve(String.valueOf(resumeId));
+        Files.createDirectories(directory);
+        Path target = directory.resolve(UUID.randomUUID() + "-" + sanitizeFileName(fileName));
+        Files.write(target, bytes);
+        return target.toAbsolutePath().toString();
+    }
+
+    private String sanitizeFileName(String fileName) {
+        String value = ResumeTextUtils.safe(fileName);
+        if (value.isBlank()) {
+            return "resume";
+        }
+        String normalized = value.replace('\\', '/');
+        int slashIndex = normalized.lastIndexOf('/');
+        String name = slashIndex >= 0 ? normalized.substring(slashIndex + 1) : normalized;
+        return name.replaceAll("[\\r\\n\\t]+", "_").trim();
+    }
+
     /**
      * 简历问答入口：
      * 先做意图判断，再决定是否执行简历 RAG 检索。
@@ -266,6 +459,29 @@ public class DocumentLoader {
                 用户问题：%s
                 """.formatted(query);
         return chatLanguageModel.chat(prompt);
+    }
+
+    public ResumeDownload downloadResume(String userId, Long resumeId) throws IOException {
+        if (resumeId == null || resumeId <= 0) {
+            throw new IllegalArgumentException("resumeId 无效");
+        }
+        String normalizedUserId = ResumeTextUtils.normalizeUserId(userId);
+        String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
+        ResumeDocumentEntity entity = resumeDocumentMapper.selectByIdAndUserIdKeyAndSourceType(resumeId, userIdKey, SOURCE_TYPE_RESUME);
+        if (entity == null) {
+            throw new IllegalArgumentException("未找到该简历或无权下载");
+        }
+        Path path = Path.of(ResumeTextUtils.safe(entity.getStoredFilePath()));
+        if (!Files.exists(path) || !Files.isRegularFile(path)) {
+            throw new IOException("简历原文件不存在");
+        }
+        return new ResumeDownload(
+                entity.getId(),
+                entity.getCandidateName(),
+                entity.getOriginalFileName(),
+                entity.getContentType(),
+                Files.readAllBytes(path)
+        );
     }
 
     /**
@@ -302,6 +518,8 @@ public class DocumentLoader {
         String prompt = """
                 你是一个简历分析助手。
                 你会收到按父块去重后的简历上下文，每个父块可能由多个子块检索命中后合并而来。
+                每段上下文头部包含 resumeId、candidateName、fileName 和 downloadUrl。
+                如果问题是在找候选人，请按候选人归纳输出，多个人都符合时列出多个人，并附上对应 downloadUrl。
                 请优先理解 parentBlock 再回答，不要编造。
                 如果简历中没有相关信息，请明确回答：未在该用户简历中找到相关信息。
 
@@ -732,14 +950,17 @@ public class DocumentLoader {
             Metadata metadata = segment.metadata();
             String parentIndex = metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("parentIndex"));
             String parentType = metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("parentType"));
+            String resumeId = metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("resumeId"));
+            String candidateName = metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("candidateName"));
+            String fileName = metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("fileName"));
             Long parentBlockId = parseParentBlockId(metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("parentBlockId")));
             String fallback = ResumeTextUtils.safe(segment.text());
 
-            String parentKey = parentIndex.isBlank() ? "fallback-" + fallback.hashCode() : parentIndex;
+            String parentKey = parentIndex.isBlank() ? "fallback-" + fallback.hashCode() : resumeId + ":" + parentIndex;
             String context = fallback;
             double score = weightedReciprocalRank(i, vectorRecallWeight);
 
-            ParentCandidate incoming = new ParentCandidate(parentKey, parentType, parentBlockId, context, score);
+            ParentCandidate incoming = new ParentCandidate(parentKey, parentType, resumeId, candidateName, fileName, parentBlockId, context, score);
             ParentCandidate existing = candidates.get(parentKey);
             if (existing == null || incoming.score() > existing.score()) {
                 candidates.put(parentKey, incoming);
@@ -748,16 +969,19 @@ public class DocumentLoader {
 
         for (int i = 0; i < keywordHits.size(); i++) {
             KeywordHit hit = keywordHits.get(i);
-            String parentKey = hit.parentIndex().isBlank() ? "kw-" + i : hit.parentIndex();
+            String parentKey = hit.parentIndex().isBlank() ? "kw-" + i : hit.resumeId() + ":" + hit.parentIndex();
             ParentCandidate existing = candidates.get(parentKey);
             double score = weightedReciprocalRank(i, keywordRecallWeight);
             Long keywordParentBlockId = parseParentBlockId(hit.parentBlockId());
             if (existing == null) {
-                candidates.put(parentKey, new ParentCandidate(parentKey, hit.parentType(), keywordParentBlockId, "", score));
+                candidates.put(parentKey, new ParentCandidate(parentKey, hit.parentType(), hit.resumeId(), hit.candidateName(), hit.fileName(), keywordParentBlockId, "", score));
             } else {
                 candidates.put(parentKey, new ParentCandidate(
                         existing.parentKey(),
                         existing.parentType().isBlank() ? hit.parentType() : existing.parentType(),
+                        existing.resumeId().isBlank() ? hit.resumeId() : existing.resumeId(),
+                        existing.candidateName().isBlank() ? hit.candidateName() : existing.candidateName(),
+                        existing.fileName().isBlank() ? hit.fileName() : existing.fileName(),
                         existing.parentBlockId() == null ? keywordParentBlockId : existing.parentBlockId(),
                         existing.context(),
                         existing.score() + score
@@ -779,7 +1003,12 @@ public class DocumentLoader {
                     String type = candidate.parentType().isBlank() ? "resume" : candidate.parentType();
                     String dbContent = candidate.parentBlockId() == null ? "" : ResumeTextUtils.safe(parentContentById.get(candidate.parentBlockId()));
                     String content = dbContent.isBlank() ? candidate.context() : dbContent;
-                    return "【parentType=" + type + ", parentIndex=" + candidate.parentKey() + "】\n" + content;
+                    return "【resumeId=" + candidate.resumeId()
+                            + ", candidateName=" + candidate.candidateName()
+                            + ", fileName=" + candidate.fileName()
+                            + ", downloadUrl=/api/documents/resumes/" + candidate.resumeId() + "/download"
+                            + ", parentType=" + type
+                            + ", parentIndex=" + candidate.parentKey() + "】\n" + content;
                 })
                 .toList();
     }
@@ -794,7 +1023,7 @@ public class DocumentLoader {
             String redisQuery = "@userIdKey:{" + userIdKey + "} @sourceType:{resume} @text:(" + textClause + ")";
             FTSearchParams params = FTSearchParams.searchParams()
                     .limit(0, limit)
-                    .returnFields("parentType", "parentIndex", "parentBlockId")
+                    .returnFields("parentType", "parentIndex", "parentBlockId", "resumeId", "candidateName", "fileName")
                     .dialect(2);
             SearchResult result = unifiedJedis.ftSearch(vectorIndexName, redisQuery, params);
             if (result == null || result.getDocuments() == null) {
@@ -811,20 +1040,28 @@ public class DocumentLoader {
 
     private KeywordHit toKeywordHit(redis.clients.jedis.search.Document doc) {
         if (doc == null) {
-            return new KeywordHit("", "", "");
+            return new KeywordHit("", "", "", "", "", "");
         }
         return new KeywordHit(
                 ResumeTextUtils.safe(doc.getString("parentType")),
                 ResumeTextUtils.safe(doc.getString("parentIndex")),
-                ResumeTextUtils.safe(doc.getString("parentBlockId"))
+                ResumeTextUtils.safe(doc.getString("parentBlockId")),
+                ResumeTextUtils.safe(doc.getString("resumeId")),
+                ResumeTextUtils.safe(doc.getString("candidateName")),
+                ResumeTextUtils.safe(doc.getString("fileName"))
         );
     }
 
-    private Long saveParentBlock(String normalizedUserId, String userIdKey, int parentIndex, ParentBlock parentBlock) {
+    private Long saveParentBlock(String normalizedUserId,
+                                 String userIdKey,
+                                 Long resumeDocumentId,
+                                 int parentIndex,
+                                 ParentBlock parentBlock) {
         ResumeParentBlockEntity entity = new ResumeParentBlockEntity();
         entity.setUserId(normalizedUserId);
         entity.setUserIdKey(userIdKey);
         entity.setSourceType(SOURCE_TYPE_RESUME);
+        entity.setResumeDocumentId(resumeDocumentId);
         entity.setParentIndex(String.valueOf(parentIndex));
         entity.setParentType(parentBlock.type());
         entity.setContent(parentBlock.content());
@@ -837,6 +1074,7 @@ public class DocumentLoader {
 
     private void purgeExistingResumeData(String userIdKey) {
         resumeParentBlockMapper.deleteByUserIdKeyAndSourceType(userIdKey, SOURCE_TYPE_RESUME);
+        resumeDocumentMapper.deleteByUserIdKeyAndSourceType(userIdKey, SOURCE_TYPE_RESUME);
         purgeRedisVectorsByUser(userIdKey);
     }
 
@@ -944,10 +1182,24 @@ public class DocumentLoader {
     private record ParentBlock(String type, String content) {
     }
 
-    private record ParentCandidate(String parentKey, String parentType, Long parentBlockId, String context, double score) {
+    private record ParentCandidate(
+            String parentKey,
+            String parentType,
+            String resumeId,
+            String candidateName,
+            String fileName,
+            Long parentBlockId,
+            String context,
+            double score
+    ) {
     }
 
-    private record KeywordHit(String parentType, String parentIndex, String parentBlockId) {
+    private record KeywordHit(String parentType,
+                              String parentIndex,
+                              String parentBlockId,
+                              String resumeId,
+                              String candidateName,
+                              String fileName) {
     }
 
     /**
@@ -1008,10 +1260,57 @@ public class DocumentLoader {
 
     public record UploadResult(
             String userId,
+            Long resumeId,
+            String candidateName,
             String fileName,
             int segmentCount,
             int characterCount,
             Integer embeddingTokenCount
+    ) {
+    }
+
+    public record BatchUploadResult(
+            String userId,
+            List<UploadResult> uploaded,
+            List<SkippedUpload> skipped
+    ) {
+    }
+
+    public record SkippedUpload(
+            String fileName,
+            String reason
+    ) {
+    }
+
+    public record ResumeDownload(
+            Long resumeId,
+            String candidateName,
+            String fileName,
+            String contentType,
+            byte[] bytes
+    ) {
+    }
+
+    private record UploadedResumeFile(
+            String fileName,
+            String contentType,
+            byte[] bytes
+    ) {
+    }
+
+    private record ParsedResume(
+            String fileName,
+            String contentType,
+            byte[] bytes,
+            Document document,
+            String normalizedText,
+            ResumeProfile profile
+    ) {
+    }
+
+    private record ResumeProfile(
+            boolean isResume,
+            String candidateName
     ) {
     }
 

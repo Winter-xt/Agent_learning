@@ -20,6 +20,9 @@ public class ResumeParentBlockEntity {
     @TableField("source_type")
     private String sourceType;
 
+    @TableField("resume_document_id")
+    private Long resumeDocumentId;
+
     @TableField("parent_index")
     private String parentIndex;
 
@@ -59,6 +62,14 @@ public class ResumeParentBlockEntity {
 
     public void setSourceType(String sourceType) {
         this.sourceType = sourceType;
+    }
+
+    public Long getResumeDocumentId() {
+        return resumeDocumentId;
+    }
+
+    public void setResumeDocumentId(Long resumeDocumentId) {
+        this.resumeDocumentId = resumeDocumentId;
     }
 
     public String getParentIndex() {

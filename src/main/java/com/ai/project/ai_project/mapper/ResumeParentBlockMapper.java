@@ -12,4 +12,7 @@ public interface ResumeParentBlockMapper extends BaseMapper<ResumeParentBlockEnt
     @Delete("DELETE FROM resume_parent_block WHERE user_id_key = #{userIdKey} AND source_type = #{sourceType}")
     int deleteByUserIdKeyAndSourceType(@Param("userIdKey") String userIdKey,
                                        @Param("sourceType") String sourceType);
+
+    @Delete("DELETE FROM resume_parent_block WHERE resume_document_id = #{resumeDocumentId}")
+    int deleteByResumeDocumentId(@Param("resumeDocumentId") Long resumeDocumentId);
 }

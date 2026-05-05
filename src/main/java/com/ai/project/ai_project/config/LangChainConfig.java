@@ -46,10 +46,10 @@ public class LangChainConfig {
     @Value("${spring.data.redis.port:6379}")
     private int redisPort;
 
-    @Value("${app.vector.index-name:talent-index-v3}")
+    @Value("${app.vector.index-name:talent-index-v4}")
     private String vectorIndexName;
 
-    @Value("${app.vector.prefix:talent:v3:}")
+    @Value("${app.vector.prefix:talent:v4:}")
     private String vectorPrefix;
 
     @Bean
@@ -79,6 +79,8 @@ public class LangChainConfig {
                         Map.entry("userIdKey", TagField.of("$.userIdKey").as("userIdKey")),
                         Map.entry("sourceType", TagField.of("$.sourceType").as("sourceType")),
                         Map.entry("userId", TagField.of("$.userId").as("userId")),
+                        Map.entry("resumeId", TagField.of("$.resumeId").as("resumeId")),
+                        Map.entry("candidateName", TextField.of("$.candidateName").as("candidateName")),
                         Map.entry("fileName", TextField.of("$.fileName").as("fileName")),
                         Map.entry("contentType", TagField.of("$.contentType").as("contentType")),
                         Map.entry("uploadedAt", TagField.of("$.uploadedAt").as("uploadedAt")),

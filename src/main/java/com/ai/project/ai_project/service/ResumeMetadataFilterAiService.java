@@ -43,6 +43,24 @@ public interface ResumeMetadataFilterAiService {
     String extract(@UserMessage String query);
 
     @SystemMessage("""
+            你是一个“简历文件识别和主信息提取器”。
+            请阅读用户提供的文档文本，判断它是否是一份候选人简历，并提取候选人姓名。
+
+            仅允许输出以下字段：
+            - isResume: boolean，只有当文本明显包含候选人的个人信息、教育经历、工作/实习经历、项目经历、技能等简历特征时才为 true。
+            - candidateName: 候选人姓名。无法确定时输出空字符串。
+
+            判断要求：
+            1) 招聘 JD、岗位说明、合同、论文、发票、说明书、普通文章、空白/乱码文档都不是简历。
+            2) 不要把公司名、学校名、项目名、文件名当作候选人姓名。
+            3) 只输出一个 JSON 对象，不要输出 Markdown，不要解释，不要输出额外 key。
+
+            示例输出：
+            {"isResume":true,"candidateName":"张三"}
+            """)
+    String extractResumeProfile(@UserMessage String resumeText);
+
+    @SystemMessage("""
             你是一个“简历 metadata 关键词提取器”。
             请阅读用户提供的简历文本，提取后续招聘检索可能会用到的关键词，并严格按 JSON 输出。
 
