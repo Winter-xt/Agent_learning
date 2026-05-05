@@ -55,14 +55,14 @@ public class DocumentLoader {
     private static final int PARENT_BLOCK_CACHE_TTL_SECONDS = 24 * 60 * 60;
     private static final int RESUME_KEYWORD_TEXT_LIMIT = 12000;
     private static final DocumentSplitter CHILD_SPLITTER = DocumentSplitters.recursive(200, 40);
-    private static final Set<String> FAMOUS_SCHOOL_SIGNALS = Set.of(
+    private static final List<String> FAMOUS_SCHOOL_SIGNALS = List.of(
             "985", "211", "双一流", "c9", "清华", "北大", "北京大学", "复旦", "上海交通大学", "上海交大",
             "浙江大学", "浙大", "中国科学技术大学", "中科大", "南京大学", "南大", "哈尔滨工业大学", "哈工大",
             "西安交通大学", "西安交大", "中国人民大学", "人大", "同济大学", "北京航空航天大学", "北航",
             "北京理工大学", "北理工", "南开大学", "天津大学", "武汉大学", "华中科技大学", "中山大学",
             "厦门大学", "东南大学"
     );
-    private static final Set<String> BIG_COMPANY_SIGNALS = Set.of(
+    private static final List<String> BIG_COMPANY_SIGNALS = List.of(
             "阿里", "淘宝", "天猫", "腾讯", "微信", "字节", "抖音", "快手", "美团", "京东", "百度", "网易",
             "拼多多", "小米", "华为", "滴滴", "蚂蚁", "shopee", "google", "meta", "facebook", "amazon",
             "microsoft", "apple", "netflix"
@@ -381,12 +381,35 @@ public class DocumentLoader {
             if (keyword.isBlank()) {
                 continue;
             }
-            Filter categoryFilter = metadataKey(metadataField).isIn(keyword);
-            if (!"resumeKeywords".equals(metadataField)) {
-                categoryFilter = new Or(categoryFilter, metadataKey("resumeKeywords").isIn(keyword));
-            }
-            target.add(categoryFilter);
+            target.add(buildAnyKeywordFilter(metadataField, expandSemanticQueryKeywords(keyword)));
         }
+    }
+
+    private Filter buildAnyKeywordFilter(String metadataField, List<String> keywords) {
+        List<Filter> filters = new ArrayList<>();
+        for (String rawKeyword : keywords) {
+            String keyword = normalizeKeyword(rawKeyword);
+            if (keyword.isBlank()) {
+                continue;
+            }
+            filters.add(metadataKey(metadataField).isIn(keyword));
+            if (!"resumeKeywords".equals(metadataField)) {
+                filters.add(metadataKey("resumeKeywords").isIn(keyword));
+            }
+        }
+        return mergeWithOr(filters);
+    }
+
+    private List<String> expandSemanticQueryKeywords(String keyword) {
+        String normalizedKeyword = normalizeKeywordMatchText(keyword);
+        List<String> expanded = new ArrayList<>();
+        expanded.add(keyword);
+        if ("名校".equals(normalizedKeyword)) {
+            expanded.addAll(FAMOUS_SCHOOL_SIGNALS);
+        } else if ("大厂".equals(normalizedKeyword)) {
+            expanded.addAll(BIG_COMPANY_SIGNALS);
+        }
+        return List.copyOf(new LinkedHashSet<>(expanded));
     }
 
     /**
@@ -397,6 +420,14 @@ public class DocumentLoader {
         Filter merged = filters.get(0);
         for (int i = 1; i < filters.size(); i++) {
             merged = new And(merged, filters.get(i));
+        }
+        return merged;
+    }
+
+    private Filter mergeWithOr(List<Filter> filters) {
+        Filter merged = filters.get(0);
+        for (int i = 1; i < filters.size(); i++) {
+            merged = new Or(merged, filters.get(i));
         }
         return merged;
     }
@@ -489,7 +520,7 @@ public class DocumentLoader {
         return false;
     }
 
-    private boolean containsAnyNormalized(String normalizedText, Set<String> signals) {
+    private boolean containsAnyNormalized(String normalizedText, List<String> signals) {
         if (normalizedText == null || normalizedText.isBlank() || signals == null || signals.isEmpty()) {
             return false;
         }
@@ -667,15 +698,21 @@ public class DocumentLoader {
                 ? fieldValue
                 : normalizeKeywordMatchText(metadata.getString("resumeKeywords"));
         for (String rawKeyword : keywords) {
-            String keyword = normalizeKeywordMatchText(rawKeyword);
-            if (keyword.isBlank()) {
-                continue;
-            }
-            if (!fieldValue.contains(keyword) && !resumeValue.contains(keyword)) {
+            if (!metadataMatchesAnyKeyword(fieldValue, resumeValue, expandSemanticQueryKeywords(rawKeyword))) {
                 return false;
             }
         }
         return true;
+    }
+
+    private boolean metadataMatchesAnyKeyword(String fieldValue, String resumeValue, List<String> keywords) {
+        for (String rawKeyword : keywords) {
+            String keyword = normalizeKeywordMatchText(rawKeyword);
+            if (!keyword.isBlank() && (fieldValue.contains(keyword) || resumeValue.contains(keyword))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
