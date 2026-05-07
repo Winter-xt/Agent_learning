@@ -52,6 +52,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
+import java.util.regex.Pattern;
 
 import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
 
@@ -66,6 +67,7 @@ public class DocumentLoader {
     private static final int PARENT_BLOCK_CACHE_TTL_SECONDS = 24 * 60 * 60;
     private static final int RESUME_KEYWORD_TEXT_LIMIT = 12000;
     private static final DocumentSplitter CHILD_SPLITTER = DocumentSplitters.recursive(200, 40);
+    private static final Pattern QUERY_TOKEN_SPLITTER = Pattern.compile("[\\s,，。！？；;:：()（）\\-_/\\.]+");
     private static final List<String> FAMOUS_SCHOOL_SIGNALS = List.of(
             "985", "211", "双一流", "c9", "清华", "北大", "北京大学", "复旦", "上海交通大学", "上海交大",
             "浙江大学", "浙大", "中国科学技术大学", "中科大", "南京大学", "南大", "哈尔滨工业大学", "哈工大",
@@ -504,11 +506,11 @@ public class DocumentLoader {
         //关键字召回
         List<KeywordHit> keywordHits = searchKeywordHits(normalizedUserId, query, 12);
 
-        List<String> parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, 4);
+        List<String> parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, query, constraints, 4);
         if (parentContexts.isEmpty()) {
             EmbeddingSearchRequest relaxedRequest = buildResumeSearchRequest(queryEmbedding, buildBaseResumeFilter(normalizedUserId), 12, 0.7);
             vectorMatches = searchVectorMatchesWithFallback(relaxedRequest, userIdKey, ResumeFilterConstraints.empty());
-            parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, 4);
+            parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, query, ResumeFilterConstraints.empty(), 4);
             if (parentContexts.isEmpty()) {
                 return "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
             }
@@ -938,8 +940,12 @@ public class DocumentLoader {
      */
     private List<String> collectHybridParentContexts(List<EmbeddingMatch<TextSegment>> vectorMatches,
                                                      List<KeywordHit> keywordHits,
+                                                     String query,
+                                                     ResumeFilterConstraints constraints,
                                                      int maxParents) {
         Map<String, ParentCandidate> candidates = new LinkedHashMap<>();
+        //关键字信息
+        HeuristicScoringContext scoringContext = buildHeuristicScoringContext(query, constraints);
 
         for (int i = 0; i < vectorMatches.size(); i++) {
             EmbeddingMatch<TextSegment> match = vectorMatches.get(i);
@@ -954,13 +960,14 @@ public class DocumentLoader {
             String candidateName = metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("candidateName"));
             String fileName = metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("fileName"));
             Long parentBlockId = parseParentBlockId(metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("parentBlockId")));
+            String metadataKeywords = metadata == null ? "" : collectMetadataKeywordText(metadata);
             String fallback = ResumeTextUtils.safe(segment.text());
 
             String parentKey = parentIndex.isBlank() ? "fallback-" + fallback.hashCode() : resumeId + ":" + parentIndex;
             String context = fallback;
             double score = weightedReciprocalRank(i, vectorRecallWeight);
 
-            ParentCandidate incoming = new ParentCandidate(parentKey, parentType, resumeId, candidateName, fileName, parentBlockId, context, score);
+            ParentCandidate incoming = new ParentCandidate(parentKey, parentType, resumeId, candidateName, fileName, metadataKeywords, parentBlockId, context, score, true, false);
             ParentCandidate existing = candidates.get(parentKey);
             if (existing == null || incoming.score() > existing.score()) {
                 candidates.put(parentKey, incoming);
@@ -974,7 +981,7 @@ public class DocumentLoader {
             double score = weightedReciprocalRank(i, keywordRecallWeight);
             Long keywordParentBlockId = parseParentBlockId(hit.parentBlockId());
             if (existing == null) {
-                candidates.put(parentKey, new ParentCandidate(parentKey, hit.parentType(), hit.resumeId(), hit.candidateName(), hit.fileName(), keywordParentBlockId, "", score));
+                candidates.put(parentKey, new ParentCandidate(parentKey, hit.parentType(), hit.resumeId(), hit.candidateName(), hit.fileName(), "", keywordParentBlockId, "", score, false, true));
             } else {
                 candidates.put(parentKey, new ParentCandidate(
                         existing.parentKey(),
@@ -982,9 +989,12 @@ public class DocumentLoader {
                         existing.resumeId().isBlank() ? hit.resumeId() : existing.resumeId(),
                         existing.candidateName().isBlank() ? hit.candidateName() : existing.candidateName(),
                         existing.fileName().isBlank() ? hit.fileName() : existing.fileName(),
+                        existing.metadataKeywords(),
                         existing.parentBlockId() == null ? keywordParentBlockId : existing.parentBlockId(),
                         existing.context(),
-                        existing.score() + score
+                        existing.score() + score,
+                        existing.vectorHit(),
+                        true
                 ));
             }
         }
@@ -997,6 +1007,7 @@ public class DocumentLoader {
         );
 
         return candidates.values().stream()
+                .map(candidate -> scoreParentCandidate(candidate, parentContentById, scoringContext))
                 .sorted(Comparator.comparingDouble(ParentCandidate::score).reversed())
                 .limit(maxParents)
                 .map(candidate -> {
@@ -1011,6 +1022,205 @@ public class DocumentLoader {
                             + ", parentIndex=" + candidate.parentKey() + "】\n" + content;
                 })
                 .toList();
+    }
+
+    private ParentCandidate scoreParentCandidate(ParentCandidate candidate,
+                                                 Map<Long, String> parentContentById,
+                                                 HeuristicScoringContext scoringContext) {
+        String dbContent = candidate.parentBlockId() == null ? "" : ResumeTextUtils.safe(parentContentById.get(candidate.parentBlockId()));
+        String content = dbContent.isBlank() ? candidate.context() : dbContent;
+        double heuristicScore = heuristicScore(candidate, content, scoringContext);
+        return new ParentCandidate(
+                candidate.parentKey(),
+                candidate.parentType(),
+                candidate.resumeId(),
+                candidate.candidateName(),
+                candidate.fileName(),
+                candidate.metadataKeywords(),
+                candidate.parentBlockId(),
+                candidate.context(),
+                candidate.score() + heuristicScore,
+                candidate.vectorHit(),
+                candidate.keywordHit()
+        );
+    }
+
+    private double heuristicScore(ParentCandidate candidate, String content, HeuristicScoringContext scoringContext) {
+        String normalizedContent = normalizeKeywordMatchText(content);
+        String normalizedMetadata = normalizeKeywordMatchText(candidate.metadataKeywords());
+        String normalizedIdentity = normalizeKeywordMatchText(candidate.candidateName() + " " + candidate.fileName());
+
+        double score = 0.0d;
+        score += keywordHitScore(scoringContext.requiredKeywords(), normalizedContent, normalizedMetadata);
+        score += queryTermHitScore(scoringContext.queryTerms(), normalizedContent, normalizedMetadata, normalizedIdentity);
+        score += positionScore(scoringContext.requiredKeywords(), content);
+        score += businessTagScore(scoringContext.businessTags(), normalizedContent, normalizedMetadata);
+        score += parentTypeScore(scoringContext.constraints(), candidate.parentType());
+        score += sourceBlendScore(candidate);
+        return score;
+    }
+
+    private double keywordHitScore(List<String> keywords, String normalizedContent, String normalizedMetadata) {
+        if (keywords.isEmpty()) {
+            return 0.0d;
+        }
+        int matched = 0;
+        for (String keyword : keywords) {
+            String normalizedKeyword = normalizeKeywordMatchText(keyword);
+            if (!normalizedKeyword.isBlank()
+                    && (normalizedContent.contains(normalizedKeyword) || normalizedMetadata.contains(normalizedKeyword))) {
+                matched++;
+            }
+        }
+        return Math.min(0.9d, matched * 0.12d);
+    }
+
+    private double queryTermHitScore(List<String> queryTerms,
+                                     String normalizedContent,
+                                     String normalizedMetadata,
+                                     String normalizedIdentity) {
+        double score = 0.0d;
+        for (String queryTerm : queryTerms) {
+            String normalizedTerm = normalizeKeywordMatchText(queryTerm);
+            if (normalizedTerm.isBlank()) {
+                continue;
+            }
+            if (normalizedIdentity.contains(normalizedTerm)) {
+                score += 0.18d;
+            } else if (normalizedMetadata.contains(normalizedTerm)) {
+                score += 0.1d;
+            } else if (normalizedContent.contains(normalizedTerm)) {
+                score += 0.06d;
+            }
+        }
+        return Math.min(0.6d, score);
+    }
+
+    private double positionScore(List<String> keywords, String content) {
+        if (keywords.isEmpty() || content == null || content.isBlank()) {
+            return 0.0d;
+        }
+        String normalizedContent = normalizeKeywordMatchText(content);
+        int bestIndex = Integer.MAX_VALUE;
+        for (String keyword : keywords) {
+            String normalizedKeyword = normalizeKeywordMatchText(keyword);
+            if (normalizedKeyword.isBlank()) {
+                continue;
+            }
+            int index = normalizedContent.indexOf(normalizedKeyword);
+            if (index >= 0 && index < bestIndex) {
+                bestIndex = index;
+            }
+        }
+        if (bestIndex == Integer.MAX_VALUE) {
+            return 0.0d;
+        }
+        double relativePosition = normalizedContent.isBlank() ? 1.0d : (double) bestIndex / Math.max(1, normalizedContent.length());
+        return Math.max(0.0d, 0.22d * (1.0d - relativePosition));
+    }
+
+    private double businessTagScore(List<BusinessTagQuery> businessTags, String normalizedContent, String normalizedMetadata) {
+        double score = 0.0d;
+        for (BusinessTagQuery businessTag : businessTags) {
+            boolean labelMatched = normalizedMetadata.contains(normalizeKeywordMatchText(businessTag.label()))
+                    || normalizedContent.contains(normalizeKeywordMatchText(businessTag.label()));
+            boolean signalMatched = false;
+            for (String signal : businessTag.signals()) {
+                String normalizedSignal = normalizeKeywordMatchText(signal);
+                if (!normalizedSignal.isBlank()
+                        && (normalizedMetadata.contains(normalizedSignal) || normalizedContent.contains(normalizedSignal))) {
+                    signalMatched = true;
+                    break;
+                }
+            }
+            if (labelMatched || signalMatched) {
+                score += 0.35d;
+            }
+        }
+        return Math.min(0.7d, score);
+    }
+
+    private double parentTypeScore(ResumeFilterConstraints constraints, String parentType) {
+        if (constraints.parentType().isBlank()) {
+            return 0.0d;
+        }
+        return constraints.parentType().equals(ResumeTextUtils.safe(parentType)) ? 0.18d : -0.12d;
+    }
+
+    private double sourceBlendScore(ParentCandidate candidate) {
+        if (candidate.vectorHit() && candidate.keywordHit()) {
+            return 0.25d;
+        }
+        if (candidate.keywordHit()) {
+            return 0.08d;
+        }
+        return 0.0d;
+    }
+
+    private HeuristicScoringContext buildHeuristicScoringContext(String query, ResumeFilterConstraints constraints) {
+        List<String> requiredKeywords = collectConstraintKeywords(constraints);
+        return new HeuristicScoringContext(
+                extractQueryTerms(query),
+                requiredKeywords,
+                buildBusinessTagQueries(requiredKeywords),
+                constraints
+        );
+    }
+
+    private List<String> collectConstraintKeywords(ResumeFilterConstraints constraints) {
+        Set<String> keywords = new LinkedHashSet<>();
+        keywords.addAll(constraints.skills());
+        keywords.addAll(constraints.companies());
+        keywords.addAll(constraints.schools());
+        keywords.addAll(constraints.titles());
+        keywords.addAll(constraints.projects());
+        keywords.addAll(constraints.industries());
+        keywords.addAll(constraints.keywords());
+        return keywords.stream()
+                .map(this::normalizeKeyword)
+                .filter(keyword -> !keyword.isBlank())
+                .toList();
+    }
+
+    private List<String> extractQueryTerms(String query) {
+        String normalized = ResumeTextUtils.safe(query);
+        if (normalized.isBlank()) {
+            return List.of();
+        }
+        return QUERY_TOKEN_SPLITTER.splitAsStream(normalized)
+                .map(this::normalizeKeyword)
+                .filter(term -> term.length() >= 2)
+                .distinct()
+                .limit(20)
+                .toList();
+    }
+
+    private List<BusinessTagQuery> buildBusinessTagQueries(List<String> keywords) {
+        List<BusinessTagQuery> businessTags = new ArrayList<>();
+        for (String keyword : keywords) {
+            String normalizedKeyword = normalizeKeywordMatchText(keyword);
+            if ("名校".equals(normalizedKeyword)) {
+                businessTags.add(new BusinessTagQuery("名校", FAMOUS_SCHOOL_SIGNALS));
+            } else if ("大厂".equals(normalizedKeyword)) {
+                businessTags.add(new BusinessTagQuery("大厂", BIG_COMPANY_SIGNALS));
+            }
+        }
+        return businessTags;
+    }
+
+    private String collectMetadataKeywordText(Metadata metadata) {
+        if (metadata == null) {
+            return "";
+        }
+        return String.join(" ",
+                ResumeTextUtils.safe(metadata.getString("resumeKeywords")),
+                ResumeTextUtils.safe(metadata.getString("skillKeywords")),
+                ResumeTextUtils.safe(metadata.getString("companyKeywords")),
+                ResumeTextUtils.safe(metadata.getString("schoolKeywords")),
+                ResumeTextUtils.safe(metadata.getString("titleKeywords")),
+                ResumeTextUtils.safe(metadata.getString("projectKeywords")),
+                ResumeTextUtils.safe(metadata.getString("industryKeywords"))
+        );
     }
 
     private List<KeywordHit> searchKeywordHits(String normalizedUserId, String query, int limit) {
@@ -1188,9 +1398,26 @@ public class DocumentLoader {
             String resumeId,
             String candidateName,
             String fileName,
+            String metadataKeywords,
             Long parentBlockId,
             String context,
-            double score
+            double score,
+            boolean vectorHit,
+            boolean keywordHit
+    ) {
+    }
+
+    private record HeuristicScoringContext(
+            List<String> queryTerms,
+            List<String> requiredKeywords,
+            List<BusinessTagQuery> businessTags,
+            ResumeFilterConstraints constraints
+    ) {
+    }
+
+    private record BusinessTagQuery(
+            String label,
+            List<String> signals
     ) {
     }
 
