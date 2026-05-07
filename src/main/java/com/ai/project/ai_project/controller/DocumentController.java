@@ -6,6 +6,7 @@ import org.springframework.http.ContentDisposition;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -26,6 +27,7 @@ import static org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR;
 @RequestMapping("/api/documents")
 @CrossOrigin(origins = "http://localhost:5173")
 public class DocumentController {
+    private static final String DEFAULT_USER_ID = "default-user";
 
     private final DocumentLoader documentLoader;
 
@@ -34,10 +36,9 @@ public class DocumentController {
     }
 
     @PostMapping(value = "/upload-resume", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public DocumentLoader.UploadResult uploadResume(@RequestParam(defaultValue = "default-user") String userId,
-                                                    @RequestPart("file") MultipartFile file) {
+    public DocumentLoader.UploadResult uploadResume(@RequestPart("file") MultipartFile file) {
         try {
-            return documentLoader.loadResume(userId, file);
+            return documentLoader.loadResume(DEFAULT_USER_ID, file);
         } catch (IllegalArgumentException e) {
             throw new ResponseStatusException(BAD_REQUEST, e.getMessage(), e);
         } catch (IOException e) {
@@ -46,10 +47,9 @@ public class DocumentController {
     }
 
     @PostMapping(value = "/upload-resumes", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public DocumentLoader.BatchUploadResult uploadResumes(@RequestParam(defaultValue = "default-user") String userId,
-                                                          @RequestPart("files") MultipartFile[] files) {
+    public DocumentLoader.BatchUploadResult uploadResumes(@RequestPart("files") MultipartFile[] files) {
         try {
-            return documentLoader.loadResumes(userId, files);
+            return documentLoader.loadResumes(DEFAULT_USER_ID, files);
         } catch (IllegalArgumentException e) {
             throw new ResponseStatusException(BAD_REQUEST, e.getMessage(), e);
         } catch (IOException e) {
@@ -58,10 +58,24 @@ public class DocumentController {
     }
 
     @GetMapping("/query-resume")
-    public String queryResume(@RequestParam(defaultValue = "default-user") String userId,
-                              @RequestParam String query) {
+    public String queryResume(@RequestParam String query) {
         try {
-            return documentLoader.queryResume(userId, query);
+            return documentLoader.queryResume(DEFAULT_USER_ID, query);
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(BAD_REQUEST, e.getMessage(), e);
+        }
+    }
+
+    @GetMapping("/resumes")
+    public java.util.List<DocumentLoader.ResumeListItem> listResumes() {
+        return documentLoader.listResumes(DEFAULT_USER_ID);
+    }
+
+    @DeleteMapping("/resumes/{resumeId}")
+    public DocumentLoader.DeleteResumeResult deleteResume(@RequestParam(defaultValue = "default-user") String userId,
+                                                          @PathVariable Long resumeId) {
+        try {
+            return documentLoader.deleteResume(userId, resumeId);
         } catch (IllegalArgumentException e) {
             throw new ResponseStatusException(BAD_REQUEST, e.getMessage(), e);
         }

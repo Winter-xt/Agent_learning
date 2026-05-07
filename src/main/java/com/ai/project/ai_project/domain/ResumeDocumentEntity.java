@@ -22,6 +22,9 @@ public class ResumeDocumentEntity {
     @TableField("candidate_name")
     private String candidateName;
 
+    @TableField("candidate_name_key")
+    private String candidateNameKey;
+
     @TableField("original_file_name")
     private String originalFileName;
 
@@ -76,6 +79,14 @@ public class ResumeDocumentEntity {
 
     public void setCandidateName(String candidateName) {
         this.candidateName = candidateName;
+    }
+
+    public String getCandidateNameKey() {
+        return candidateNameKey;
+    }
+
+    public void setCandidateNameKey(String candidateNameKey) {
+        this.candidateNameKey = candidateNameKey;
     }
 
     public String getOriginalFileName() {

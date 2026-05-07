@@ -163,12 +163,23 @@ public class DocumentLoader {
 
         List<UploadResult> uploaded = new ArrayList<>();
         List<SkippedUpload> skipped = new ArrayList<>();
+        Set<String> seenCandidateKeys = new LinkedHashSet<>();
         for (UploadedResumeFile uploadedFile : uploadedFiles) {
             try {
                 validateExtension(uploadedFile.fileName());
                 ParsedResume parsedResume = parseResumeFile(uploadedFile.fileName(), uploadedFile.contentType(), uploadedFile.bytes());
                 if (!parsedResume.profile().isResume()) {
                     skipped.add(new SkippedUpload(uploadedFile.fileName(), "不是候选人简历"));
+                    continue;
+                }
+                String candidateName = resolveCandidateName(parsedResume.profile().candidateName(), parsedResume.fileName());
+                String candidateNameKey = normalizeCandidateNameKey(candidateName);
+                if (!seenCandidateKeys.add(candidateNameKey)) {
+                    skipped.add(new SkippedUpload(uploadedFile.fileName(), "同一批次中候选人重复：" + candidateName));
+                    continue;
+                }
+                if (resumeDocumentMapper.selectByUserIdKeyAndCandidateNameKey(userIdKey, SOURCE_TYPE_RESUME, candidateNameKey) != null) {
+                    skipped.add(new SkippedUpload(uploadedFile.fileName(), "候选人已存在：" + candidateName));
                     continue;
                 }
                 uploaded.add(persistParsedResume(normalizedUserId, userIdKey, parsedResume));
@@ -394,7 +405,9 @@ public class DocumentLoader {
         entity.setUserId(normalizedUserId);
         entity.setUserIdKey(userIdKey);
         entity.setSourceType(SOURCE_TYPE_RESUME);
-        entity.setCandidateName(resolveCandidateName(parsedResume.profile().candidateName(), parsedResume.fileName()));
+        String candidateName = resolveCandidateName(parsedResume.profile().candidateName(), parsedResume.fileName());
+        entity.setCandidateName(candidateName);
+        entity.setCandidateNameKey(normalizeCandidateNameKey(candidateName));
         entity.setOriginalFileName(parsedResume.fileName() == null ? "" : parsedResume.fileName());
         entity.setStoredFilePath("");
         entity.setContentType(parsedResume.contentType() == null ? "" : parsedResume.contentType());
@@ -417,6 +430,14 @@ public class DocumentLoader {
         String sanitized = sanitizeFileName(fileName);
         int dotIndex = sanitized.lastIndexOf('.');
         return dotIndex > 0 ? sanitized.substring(0, dotIndex) : sanitized;
+    }
+
+    private String normalizeCandidateNameKey(String candidateName) {
+        String key = normalizeKeywordMatchText(candidateName);
+        if (key.isBlank()) {
+            return "unknown";
+        }
+        return key.length() > 128 ? key.substring(0, 128) : key;
     }
 
     private String storeOriginalResumeFile(String userIdKey, Long resumeId, String fileName, byte[] bytes) throws IOException {
@@ -483,6 +504,53 @@ public class DocumentLoader {
                 entity.getOriginalFileName(),
                 entity.getContentType(),
                 Files.readAllBytes(path)
+        );
+    }
+
+    public List<ResumeListItem> listResumes(String userId) {
+        String normalizedUserId = ResumeTextUtils.normalizeUserId(userId);
+        String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
+        List<ResumeDocumentEntity> entities = resumeDocumentMapper.selectByUserIdKeyAndSourceType(userIdKey, SOURCE_TYPE_RESUME);
+        if (entities == null || entities.isEmpty()) {
+            return List.of();
+        }
+        List<ResumeListItem> items = new ArrayList<>();
+        for (ResumeDocumentEntity entity : entities) {
+            items.add(new ResumeListItem(
+                    entity.getId(),
+                    entity.getCandidateName(),
+                    entity.getOriginalFileName(),
+                    entity.getContentType(),
+                    entity.getSegmentCount() == null ? 0 : entity.getSegmentCount(),
+                    entity.getCharacterCount() == null ? 0 : entity.getCharacterCount(),
+                    entity.getUploadedAt() == null ? "" : entity.getUploadedAt().toString()
+            ));
+        }
+        return items;
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public DeleteResumeResult deleteResume(String userId, Long resumeId) {
+        if (resumeId == null || resumeId <= 0) {
+            throw new IllegalArgumentException("resumeId 无效");
+        }
+        String normalizedUserId = ResumeTextUtils.normalizeUserId(userId);
+        String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
+        ResumeDocumentEntity entity = resumeDocumentMapper.selectByIdAndUserIdKeyAndSourceType(resumeId, userIdKey, SOURCE_TYPE_RESUME);
+        if (entity == null) {
+            throw new IllegalArgumentException("未找到该候选人简历");
+        }
+
+        purgeRedisVectorsByResumeId(userIdKey, resumeId);
+        resumeParentBlockMapper.deleteByResumeDocumentId(resumeId);
+        int affected = resumeDocumentMapper.deleteByIdAndUserIdKeyAndSourceType(resumeId, userIdKey, SOURCE_TYPE_RESUME);
+        tryDeleteStoredFile(entity.getStoredFilePath());
+
+        return new DeleteResumeResult(
+                normalizedUserId,
+                resumeId,
+                entity.getCandidateName(),
+                affected > 0
         );
     }
 
@@ -1312,6 +1380,43 @@ public class DocumentLoader {
         }
     }
 
+    private void purgeRedisVectorsByResumeId(String userIdKey, Long resumeId) {
+        String resumeIdText = String.valueOf(resumeId);
+        while (true) {
+            String redisQuery = "@userIdKey:{" + userIdKey + "} @sourceType:{resume} @resumeId:{" + resumeIdText + "}";
+            FTSearchParams params = FTSearchParams.searchParams()
+                    .limit(0, REDIS_PURGE_BATCH_SIZE)
+                    .dialect(2);
+            SearchResult result = unifiedJedis.ftSearch(vectorIndexName, redisQuery, params);
+            if (result == null || result.getDocuments() == null || result.getDocuments().isEmpty()) {
+                return;
+            }
+            List<String> redisDocIds = result.getDocuments().stream()
+                    .map(redis.clients.jedis.search.Document::getId)
+                    .filter(id -> id != null && !id.isBlank())
+                    .toList();
+            if (redisDocIds.isEmpty()) {
+                return;
+            }
+            unifiedJedis.del(redisDocIds.toArray(new String[0]));
+            if (redisDocIds.size() < REDIS_PURGE_BATCH_SIZE) {
+                return;
+            }
+        }
+    }
+
+    private void tryDeleteStoredFile(String storedFilePath) {
+        String path = ResumeTextUtils.safe(storedFilePath);
+        if (path.isBlank()) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(Path.of(path));
+        } catch (Exception ignored) {
+            // no-op
+        }
+    }
+
     private Map<Long, String> loadParentBlockContents(List<Long> parentBlockIds) {
         if (parentBlockIds == null || parentBlockIds.isEmpty()) {
             return Map.of();
@@ -1515,6 +1620,25 @@ public class DocumentLoader {
             String fileName,
             String contentType,
             byte[] bytes
+    ) {
+    }
+
+    public record ResumeListItem(
+            Long resumeId,
+            String candidateName,
+            String fileName,
+            String contentType,
+            int segmentCount,
+            int characterCount,
+            String uploadedAt
+    ) {
+    }
+
+    public record DeleteResumeResult(
+            String userId,
+            Long resumeId,
+            String candidateName,
+            boolean deleted
     ) {
     }
 

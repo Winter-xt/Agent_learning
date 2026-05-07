@@ -6,6 +6,7 @@ import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Delete;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
+import java.util.List;
 
 @Mapper
 public interface ResumeDocumentMapper extends BaseMapper<ResumeDocumentEntity> {
@@ -15,7 +16,21 @@ public interface ResumeDocumentMapper extends BaseMapper<ResumeDocumentEntity> {
                                                              @Param("userIdKey") String userIdKey,
                                                              @Param("sourceType") String sourceType);
 
+    @Select("SELECT * FROM resume_document WHERE user_id_key = #{userIdKey} AND source_type = #{sourceType} AND candidate_name_key = #{candidateNameKey} LIMIT 1")
+    ResumeDocumentEntity selectByUserIdKeyAndCandidateNameKey(@Param("userIdKey") String userIdKey,
+                                                              @Param("sourceType") String sourceType,
+                                                              @Param("candidateNameKey") String candidateNameKey);
+
     @Delete("DELETE FROM resume_document WHERE user_id_key = #{userIdKey} AND source_type = #{sourceType}")
     int deleteByUserIdKeyAndSourceType(@Param("userIdKey") String userIdKey,
                                        @Param("sourceType") String sourceType);
+
+    @Select("SELECT * FROM resume_document WHERE user_id_key = #{userIdKey} AND source_type = #{sourceType} ORDER BY uploaded_at DESC, id DESC")
+    List<ResumeDocumentEntity> selectByUserIdKeyAndSourceType(@Param("userIdKey") String userIdKey,
+                                                              @Param("sourceType") String sourceType);
+
+    @Delete("DELETE FROM resume_document WHERE id = #{id} AND user_id_key = #{userIdKey} AND source_type = #{sourceType}")
+    int deleteByIdAndUserIdKeyAndSourceType(@Param("id") Long id,
+                                            @Param("userIdKey") String userIdKey,
+                                            @Param("sourceType") String sourceType);
 }
