@@ -24,7 +24,6 @@ import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.filter.Filter;
 import dev.langchain4j.store.embedding.filter.logical.And;
-import dev.langchain4j.store.embedding.filter.logical.Or;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
@@ -141,8 +140,7 @@ public class DocumentLoader {
         }
 
         String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
-        purgeExistingResumeData(userIdKey);
-        return persistParsedResume(normalizedUserId, userIdKey, parsedResume);
+        return upsertParsedResume(normalizedUserId, userIdKey, parsedResume);
     }
 
     @Transactional(rollbackFor = Exception.class)
@@ -178,6 +176,18 @@ public class DocumentLoader {
                     skipped.add(new SkippedUpload(uploadedFile.fileName(), "同一批次中候选人重复：" + candidateName));
                     continue;
                 }
+                ResumeDocumentEntity existing = resumeDocumentMapper
+                        .selectByUserIdKeyAndCandidateNameKeyAndOriginalFileName(
+                                userIdKey,
+                                SOURCE_TYPE_RESUME,
+                                candidateNameKey,
+                                uploadedFile.fileName()
+                        );
+                if (existing != null) {
+                    deleteResumeDataByEntity(userIdKey, existing);
+                    uploaded.add(persistParsedResume(normalizedUserId, userIdKey, parsedResume));
+                    continue;
+                }
                 if (resumeDocumentMapper.selectByUserIdKeyAndCandidateNameKey(userIdKey, SOURCE_TYPE_RESUME, candidateNameKey) != null) {
                     skipped.add(new SkippedUpload(uploadedFile.fileName(), "候选人已存在：" + candidateName));
                     continue;
@@ -191,6 +201,22 @@ public class DocumentLoader {
         }
 
         return new BatchUploadResult(normalizedUserId, uploaded, skipped);
+    }
+
+    private UploadResult upsertParsedResume(String normalizedUserId, String userIdKey, ParsedResume parsedResume) throws IOException {
+        String candidateName = resolveCandidateName(parsedResume.profile().candidateName(), parsedResume.fileName());
+        String candidateNameKey = normalizeCandidateNameKey(candidateName);
+        ResumeDocumentEntity existing = resumeDocumentMapper
+                .selectByUserIdKeyAndCandidateNameKeyAndOriginalFileName(
+                        userIdKey,
+                        SOURCE_TYPE_RESUME,
+                        candidateNameKey,
+                        ResumeTextUtils.safe(parsedResume.fileName())
+                );
+        if (existing != null) {
+            deleteResumeDataByEntity(userIdKey, existing);
+        }
+        return persistParsedResume(normalizedUserId, userIdKey, parsedResume);
     }
 
     private ParsedResume parseResumeFile(String fileName, String contentType, byte[] bytes) throws IOException {
@@ -569,7 +595,7 @@ public class DocumentLoader {
         String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
         Embedding queryEmbedding = embeddingModel.embed(query).content();
 
-        EmbeddingSearchRequest request = buildResumeSearchRequest(queryEmbedding, buildDynamicResumeFilter(normalizedUserId, constraints), 12, 0.7);
+        EmbeddingSearchRequest request = buildResumeSearchRequest(queryEmbedding, buildDynamicResumeFilter(normalizedUserId, constraints), 50, 0.7);
         //向量召回
         List<EmbeddingMatch<TextSegment>> vectorMatches = searchVectorMatchesWithFallback(request, userIdKey, constraints);
         //关键字召回
@@ -577,7 +603,7 @@ public class DocumentLoader {
 
         List<String> parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, query, constraints, 4);
         if (parentContexts.isEmpty()) {
-            EmbeddingSearchRequest relaxedRequest = buildResumeSearchRequest(queryEmbedding, buildBaseResumeFilter(normalizedUserId), 12, 0.7);
+            EmbeddingSearchRequest relaxedRequest = buildResumeSearchRequest(queryEmbedding, buildBaseResumeFilter(normalizedUserId), 50, 0.7);
             vectorMatches = searchVectorMatchesWithFallback(relaxedRequest, userIdKey, ResumeFilterConstraints.empty());
             parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, query, ResumeFilterConstraints.empty(), 4);
             if (parentContexts.isEmpty()) {
@@ -623,24 +649,20 @@ public class DocumentLoader {
     /**
      * 动态构建简历检索 Filter：
      * - 强制约束：userIdKey/sourceType，保证只检索当前用户简历数据。
-     * - 可选约束：由 LLM 提取的 parentType/fileName/contentType/简历关键词。
+     * - 可选硬约束：由 LLM 提取的 fileName/contentType。
+     * - parentType 只进入启发式评分，不作为硬过滤，避免“Spring 经验”这类问题误排除项目经历。
+     * - 关键词 metadata 是一整串文本，Redis adapter 的 IsIn 不等价于 contains，
+     *   因此技能/学校/公司等关键词只进入 JVM contains 判断和启发式重排。
      */
     private Filter buildDynamicResumeFilter(String normalizedUserId, ResumeFilterConstraints constraints) {
         List<Filter> filters = new ArrayList<>();
         filters.add(buildBaseResumeFilter(normalizedUserId));
 
-        if (!constraints.parentType().isBlank()) {
-            filters.add(metadataKey("parentType").isEqualTo(constraints.parentType()));
-        }
         if (!constraints.fileName().isBlank()) {
             filters.add(metadataKey("fileName").isEqualTo(constraints.fileName()));
         }
         if (!constraints.contentType().isBlank()) {
             filters.add(metadataKey("contentType").isEqualTo(constraints.contentType()));
-        }
-        Filter keywordFilter = buildResumeKeywordFilter(constraints);
-        if (keywordFilter != null) {
-            filters.add(keywordFilter);
         }
 
         return mergeWithAnd(filters);
@@ -651,50 +673,6 @@ public class DocumentLoader {
                 metadataKey("userIdKey").isEqualTo(ResumeTextUtils.toHexKey(normalizedUserId)),
                 metadataKey("sourceType").isEqualTo(SOURCE_TYPE_RESUME)
         );
-    }
-
-    /**
-     * 将问题中提到的关键词映射到上传简历时写入的 metadata 字段。
-     * 同一关键词可命中分类字段或聚合字段；多个关键词之间使用 AND，避免把条件放得太宽。
-     */
-    private Filter buildResumeKeywordFilter(ResumeFilterConstraints constraints) {
-        List<Filter> requiredKeywordFilters = new ArrayList<>();
-        addKeywordFilters(requiredKeywordFilters, constraints.skills(), "skillKeywords");
-        addKeywordFilters(requiredKeywordFilters, constraints.companies(), "companyKeywords");
-        addKeywordFilters(requiredKeywordFilters, constraints.schools(), "schoolKeywords");
-        addKeywordFilters(requiredKeywordFilters, constraints.titles(), "titleKeywords");
-        addKeywordFilters(requiredKeywordFilters, constraints.projects(), "projectKeywords");
-        addKeywordFilters(requiredKeywordFilters, constraints.industries(), "industryKeywords");
-        addKeywordFilters(requiredKeywordFilters, constraints.keywords(), "resumeKeywords");
-        return requiredKeywordFilters.isEmpty() ? null : mergeWithAnd(requiredKeywordFilters);
-    }
-
-    private void addKeywordFilters(List<Filter> target, List<String> keywords, String metadataField) {
-        if (keywords == null || keywords.isEmpty()) {
-            return;
-        }
-        for (String rawKeyword : keywords) {
-            String keyword = normalizeKeyword(rawKeyword);
-            if (keyword.isBlank()) {
-                continue;
-            }
-            target.add(buildAnyKeywordFilter(metadataField, expandSemanticQueryKeywords(keyword)));
-        }
-    }
-
-    private Filter buildAnyKeywordFilter(String metadataField, List<String> keywords) {
-        List<Filter> filters = new ArrayList<>();
-        for (String rawKeyword : keywords) {
-            String keyword = normalizeKeyword(rawKeyword);
-            if (keyword.isBlank()) {
-                continue;
-            }
-            filters.add(metadataKey(metadataField).isIn(keyword));
-            if (!"resumeKeywords".equals(metadataField)) {
-                filters.add(metadataKey("resumeKeywords").isIn(keyword));
-            }
-        }
-        return mergeWithOr(filters);
     }
 
     private List<String> expandSemanticQueryKeywords(String keyword) {
@@ -717,14 +695,6 @@ public class DocumentLoader {
         Filter merged = filters.get(0);
         for (int i = 1; i < filters.size(); i++) {
             merged = new And(merged, filters.get(i));
-        }
-        return merged;
-    }
-
-    private Filter mergeWithOr(List<Filter> filters) {
-        Filter merged = filters.get(0);
-        for (int i = 1; i < filters.size(); i++) {
-            merged = new Or(merged, filters.get(i));
         }
         return merged;
     }
@@ -1043,8 +1013,9 @@ public class DocumentLoader {
             String parentKey = parentIndex.isBlank() ? "fallback-" + fallback.hashCode() : resumeId + ":" + parentIndex;
             String context = fallback;
             double score = weightedReciprocalRank(i, vectorRecallWeight);
+            boolean keywordMatched = textOrMetadataMatchesKeywords(fallback, metadataKeywords, scoringContext);
 
-            ParentCandidate incoming = new ParentCandidate(parentKey, parentType, resumeId, candidateName, fileName, metadataKeywords, parentBlockId, context, score, true, false);
+            ParentCandidate incoming = new ParentCandidate(parentKey, parentType, resumeId, candidateName, fileName, metadataKeywords, parentBlockId, context, score, true, keywordMatched);
             ParentCandidate existing = candidates.get(parentKey);
             if (existing == null || incoming.score() > existing.score()) {
                 candidates.put(parentKey, incoming);
@@ -1083,8 +1054,15 @@ public class DocumentLoader {
                         .toList()
         );
 
-        return candidates.values().stream()
+        List<ParentCandidate> scoredCandidates = candidates.values().stream()
                 .map(candidate -> scoreParentCandidate(candidate, parentContentById, scoringContext))
+                .toList();
+        boolean hasKeywordMatchedCandidate = scoredCandidates.stream().anyMatch(ParentCandidate::keywordHit);
+        List<ParentCandidate> candidatesForAnswer = hasKeywordMatchedCandidate
+                ? scoredCandidates.stream().filter(ParentCandidate::keywordHit).toList()
+                : scoredCandidates;
+
+        return candidatesForAnswer.stream()
                 .sorted(Comparator.comparingDouble(ParentCandidate::score).reversed())
                 .limit(maxParents)
                 .map(candidate -> {
@@ -1217,6 +1195,35 @@ public class DocumentLoader {
         return Math.min(0.7d, score);
     }
 
+    private boolean textOrMetadataMatchesKeywords(String text,
+                                                  String metadataKeywords,
+                                                  HeuristicScoringContext scoringContext) {
+        String normalizedText = normalizeKeywordMatchText(text);
+        String normalizedMetadata = normalizeKeywordMatchText(metadataKeywords);
+        for (String keyword : scoringContext.requiredKeywords()) {
+            if (containsAnyExpandedKeyword(normalizedText, normalizedMetadata, expandSemanticQueryKeywords(keyword))) {
+                return true;
+            }
+        }
+        for (String queryTerm : scoringContext.queryTerms()) {
+            if (containsAnyExpandedKeyword(normalizedText, normalizedMetadata, expandSemanticQueryKeywords(queryTerm))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean containsAnyExpandedKeyword(String normalizedText, String normalizedMetadata, List<String> keywords) {
+        for (String keyword : keywords) {
+            String normalizedKeyword = normalizeKeywordMatchText(keyword);
+            if (!normalizedKeyword.isBlank()
+                    && (normalizedText.contains(normalizedKeyword) || normalizedMetadata.contains(normalizedKeyword))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private double parentTypeScore(ResumeFilterConstraints constraints, String parentType) {
         if (constraints.parentType().isBlank()) {
             return 0.0d;
@@ -1307,7 +1314,16 @@ public class DocumentLoader {
             if (textClause.isBlank()) {
                 return List.of();
             }
-            String redisQuery = "@userIdKey:{" + userIdKey + "} @sourceType:{resume} @text:(" + textClause + ")";
+            String redisQuery = "@userIdKey:{" + userIdKey + "} @sourceType:{resume} ("
+                    + "@text:(" + textClause + ")"
+                    + " | @resumeKeywords:(" + textClause + ")"
+                    + " | @skillKeywords:(" + textClause + ")"
+                    + " | @companyKeywords:(" + textClause + ")"
+                    + " | @schoolKeywords:(" + textClause + ")"
+                    + " | @titleKeywords:(" + textClause + ")"
+                    + " | @projectKeywords:(" + textClause + ")"
+                    + " | @industryKeywords:(" + textClause + ")"
+                    + ")";
             FTSearchParams params = FTSearchParams.searchParams()
                     .limit(0, limit)
                     .returnFields("parentType", "parentIndex", "parentBlockId", "resumeId", "candidateName", "fileName")
@@ -1412,6 +1428,17 @@ public class DocumentLoader {
                 return;
             }
         }
+    }
+
+    private void deleteResumeDataByEntity(String userIdKey, ResumeDocumentEntity entity) {
+        if (entity == null || entity.getId() == null) {
+            return;
+        }
+        Long resumeId = entity.getId();
+        purgeRedisVectorsByResumeId(userIdKey, resumeId);
+        resumeParentBlockMapper.deleteByResumeDocumentId(resumeId);
+        resumeDocumentMapper.deleteByIdAndUserIdKeyAndSourceType(resumeId, userIdKey, SOURCE_TYPE_RESUME);
+        tryDeleteStoredFile(entity.getStoredFilePath());
     }
 
     private void tryDeleteStoredFile(String storedFilePath) {

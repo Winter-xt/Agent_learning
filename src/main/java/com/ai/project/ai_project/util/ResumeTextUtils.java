@@ -5,6 +5,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public final class ResumeTextUtils {
@@ -19,6 +20,7 @@ public final class ResumeTextUtils {
             "(19|20)\\d{2}[./-]\\d{1,2}\\s*[-~到至]\\s*((19|20)\\d{2}[./-]\\d{1,2}|至今|现在)"
     );
     private static final Pattern TOKEN_SPLITTER = Pattern.compile("[\\s,，。！？；;:：()（）\\-_/\\.]+");
+    private static final Pattern ASCII_WORD_PATTERN = Pattern.compile("[A-Za-z][A-Za-z0-9+#.]{1,}");
     private static final Pattern REDIS_ESCAPE_PATTERN = Pattern.compile("([\\\\@{}\\[\\]\\(\\)\\|\\-!~\"'])");
 
     private ResumeTextUtils() {
@@ -90,11 +92,25 @@ public final class ResumeTextUtils {
             }
             String escaped = REDIS_ESCAPE_PATTERN.matcher(token).replaceAll("\\\\$1");
             clauses.add(escaped);
+            addAsciiWordClauses(clauses, token);
             if (containsHan(token) && token.length() >= 2) {
                 clauses.add(escaped + "*");
             }
         }
         return clauses.isEmpty() ? "" : String.join(" | ", clauses);
+    }
+
+    private static void addAsciiWordClauses(Set<String> clauses, String token) {
+        Matcher matcher = ASCII_WORD_PATTERN.matcher(token);
+        while (matcher.find()) {
+            String word = matcher.group().toLowerCase(Locale.ROOT).trim();
+            if (word.length() < 2 || word.equals(token)) {
+                continue;
+            }
+            String escaped = REDIS_ESCAPE_PATTERN.matcher(word).replaceAll("\\\\$1");
+            clauses.add(escaped);
+            clauses.add(escaped + "*");
+        }
     }
 
     private static boolean looksLikeProjectContent(String content) {

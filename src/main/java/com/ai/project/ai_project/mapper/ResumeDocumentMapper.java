@@ -21,6 +21,12 @@ public interface ResumeDocumentMapper extends BaseMapper<ResumeDocumentEntity> {
                                                               @Param("sourceType") String sourceType,
                                                               @Param("candidateNameKey") String candidateNameKey);
 
+    @Select("SELECT * FROM resume_document WHERE user_id_key = #{userIdKey} AND source_type = #{sourceType} AND candidate_name_key = #{candidateNameKey} AND original_file_name = #{originalFileName} LIMIT 1")
+    ResumeDocumentEntity selectByUserIdKeyAndCandidateNameKeyAndOriginalFileName(@Param("userIdKey") String userIdKey,
+                                                                                 @Param("sourceType") String sourceType,
+                                                                                 @Param("candidateNameKey") String candidateNameKey,
+                                                                                 @Param("originalFileName") String originalFileName);
+
     @Delete("DELETE FROM resume_document WHERE user_id_key = #{userIdKey} AND source_type = #{sourceType}")
     int deleteByUserIdKeyAndSourceType(@Param("userIdKey") String userIdKey,
                                        @Param("sourceType") String sourceType);
