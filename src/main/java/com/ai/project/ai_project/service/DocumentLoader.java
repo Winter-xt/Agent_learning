@@ -478,6 +478,7 @@ public class DocumentLoader {
                 请先简短回应用户，并引导用户提出与简历检索相关的问题，例如：
                 - 候选人有哪些项目经验？
                 - 候选人是否有 Java/Spring 经验？
+                输出时不要使用 Markdown 表格，保持自然段或列表即可。
 
                 用户问题：%s
                 """.formatted(query);
@@ -591,6 +592,14 @@ public class DocumentLoader {
                 每段上下文头部包含 resumeId、candidateName、fileName 和 downloadUrl。
                 如果问题是在找候选人，请按候选人归纳输出，多个人都符合时列出多个人，并附上对应 downloadUrl。
                 请优先理解 parentBlock 再回答，不要编造。
+                输出格式要求：
+                1. 禁止使用 Markdown 表格（不要使用 | --- | 这种格式）。
+                2. 使用“编号列表 + 小标题”输出。
+                3. 每位候选人按以下结构输出：
+                   - 候选人：
+                   - 结论：
+                   - 证据：
+                   - 下载链接：
                 如果简历中没有相关信息，请明确回答：未在该用户简历中找到相关信息。
 
                 【简历上下文】
