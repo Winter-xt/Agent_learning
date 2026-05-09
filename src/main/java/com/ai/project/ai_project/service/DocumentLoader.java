@@ -26,6 +26,7 @@ import dev.langchain4j.store.embedding.filter.Filter;
 import dev.langchain4j.store.embedding.filter.logical.And;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StopWatch;
 import org.springframework.web.multipart.MultipartFile;
 import redis.clients.jedis.UnifiedJedis;
 import redis.clients.jedis.search.FTSearchParams;
@@ -49,6 +50,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Supplier;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.regex.Pattern;
@@ -97,6 +99,7 @@ public class DocumentLoader {
     private final UnifiedJedis unifiedJedis;
     private final ResumeParentBlockMapper resumeParentBlockMapper;
     private final ResumeDocumentMapper resumeDocumentMapper;
+    private final ResumeQueryTraceService resumeQueryTraceService;
     private final ApacheTikaDocumentParser parser;
     private final String vectorIndexName;
     private final Path resumeStorageDir;
@@ -112,6 +115,7 @@ public class DocumentLoader {
                           UnifiedJedis unifiedJedis,
                           ResumeParentBlockMapper resumeParentBlockMapper,
                           ResumeDocumentMapper resumeDocumentMapper,
+                          ResumeQueryTraceService resumeQueryTraceService,
                           @org.springframework.beans.factory.annotation.Value("${app.recall.vector-weight:1.0}") double vectorRecallWeight,
                           @org.springframework.beans.factory.annotation.Value("${app.recall.keyword-weight:1.0}") double keywordRecallWeight,
                           @org.springframework.beans.factory.annotation.Value("${app.vector.index-name:talent-index-v4}") String vectorIndexName,
@@ -122,6 +126,7 @@ public class DocumentLoader {
         this.unifiedJedis = unifiedJedis;
         this.resumeParentBlockMapper = resumeParentBlockMapper;
         this.resumeDocumentMapper = resumeDocumentMapper;
+        this.resumeQueryTraceService = resumeQueryTraceService;
         this.parser = new ApacheTikaDocumentParser();
         this.vectorRecallWeight = vectorRecallWeight;
         this.keywordRecallWeight = keywordRecallWeight;
@@ -500,14 +505,39 @@ public class DocumentLoader {
      * 简历问答入口：
      * 先做意图判断，再决定是否执行简历 RAG 检索。
      */
-    public String queryResume(String userId, String query) {
+    public QueryResumeResult queryResume(String userId, String query) {
         validateResumeQueryParams(userId, query);
 
+        String traceId = UUID.randomUUID().toString();
+        String normalizedUserId = ResumeTextUtils.normalizeUserId(userId);
+        String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
+        List<TraceStep> steps = new ArrayList<>();
+
         //意图识别，判断用户的问题是否需要 RAG
-        Intent intent = classifyIntent(query);
+        TimedValue<Intent> intentStep = timeValue("intent_classification", () -> classifyIntent(query));
+        Intent intent = intentStep.value();
+        steps.add(new TraceStep(
+                "intent_classification",
+                intentStep.elapsedMillis(),
+                null,
+                Map.of("intent", intent.name())
+        ));
         if (shouldUseResumeRag(intent)) {
-            String rewrittenQuery = rewriteResumeQuery(query);
-            return queryResumeWithRag(userId, query, rewrittenQuery, isHorizontalCompareIntent(intent));
+            TimedValue<String> rewriteStep = timeValue("query_rewrite", () -> rewriteResumeQuery(query));
+            String rewrittenQuery = rewriteStep.value();
+            steps.add(new TraceStep(
+                    "query_rewrite",
+                    rewriteStep.elapsedMillis(),
+                    null,
+                    Map.of(
+                            "before", ResumeTextUtils.safe(query),
+                            "after", rewrittenQuery
+                    )
+            ));
+            QueryResumeExecution execution = queryResumeWithRag(normalizedUserId, query, rewrittenQuery, isHorizontalCompareIntent(intent), steps);
+            ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, rewrittenQuery, intent.name(), execution.totalElapsedMillis(), steps);
+            resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, rewrittenQuery, intent.name(), execution.answer(), trace);
+            return new QueryResumeResult(execution.answer(), trace);
         }
 
         String prompt = """
@@ -520,7 +550,16 @@ public class DocumentLoader {
 
                 用户问题：%s
                 """.formatted(query);
-        return chatLanguageModel.chat(prompt);
+        TimedValue<String> answerStep = timeValue("chat_model", () -> chatLanguageModel.chat(prompt));
+        steps.add(new TraceStep(
+                "chat_fallback",
+                answerStep.elapsedMillis(),
+                estimateTokenCount(prompt, answerStep.value()),
+                Map.of("reason", "intent_not_resume_rag")
+        ));
+        ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, ResumeTextUtils.safe(query), intent.name(), sumElapsedMillis(steps), steps);
+        resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, query, intent.name(), answerStep.value(), trace);
+        return new QueryResumeResult(answerStep.value(), trace);
     }
 
     public ResumeDownload downloadResume(String userId, Long resumeId) throws IOException {
@@ -599,35 +638,96 @@ public class DocumentLoader {
      * 2) 动态构建 LangChain4j Filter 并执行向量/关键词混合召回；
      * 3) 将召回上下文交给模型生成最终答案。
      */
-    private String queryResumeWithRag(String userId, String originalQuery, String retrievalQuery, boolean horizontalCompare) {
-        String normalizedUserId = ResumeTextUtils.normalizeUserId(userId);
+    private QueryResumeExecution queryResumeWithRag(String normalizedUserId,
+                                                    String originalQuery,
+                                                    String retrievalQuery,
+                                                    boolean horizontalCompare,
+                                                    List<TraceStep> steps) {
+        StopWatch ragStopWatch = new StopWatch("resume-rag-query");
+        ragStopWatch.start("total");
         int vectorMaxResults = horizontalCompare ? HORIZONTAL_COMPARE_VECTOR_MAX_RESULTS : RESUME_VECTOR_MAX_RESULTS;
         int keywordMaxResults = horizontalCompare ? HORIZONTAL_COMPARE_KEYWORD_MAX_RESULTS : RESUME_KEYWORD_MAX_RESULTS;
         int parentContextLimit = horizontalCompare ? HORIZONTAL_COMPARE_PARENT_CONTEXTS : RESUME_PARENT_CONTEXTS;
         int scoreCliffMinContexts = horizontalCompare ? HORIZONTAL_COMPARE_SCORE_CLIFF_MIN_CONTEXTS : SCORE_CLIFF_MIN_CONTEXTS;
 
         //提取约束条件
-        ResumeFilterConstraints constraints = extractResumeFilterConstraints(retrievalQuery);
+        TimedValue<ResumeFilterConstraints> constraintsStep = timeValue("metadata_constraints", () -> extractResumeFilterConstraints(retrievalQuery));
+        ResumeFilterConstraints constraints = constraintsStep.value();
+        steps.add(new TraceStep(
+                "metadata_constraints",
+                constraintsStep.elapsedMillis(),
+                null,
+                Map.of("constraints", constraints)
+        ));
         String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
-        Embedding queryEmbedding = embeddingModel.embed(retrievalQuery).content();
+        TimedValue<Response<Embedding>> embeddingStep = timeValue("query_embedding", () -> embeddingModel.embed(retrievalQuery));
+        Response<Embedding> queryEmbeddingResponse = embeddingStep.value();
+        Embedding queryEmbedding = queryEmbeddingResponse.content();
+        steps.add(new TraceStep(
+                "query_embedding",
+                embeddingStep.elapsedMillis(),
+                queryEmbeddingResponse.tokenUsage() == null ? null : queryEmbeddingResponse.tokenUsage().totalTokenCount(),
+                Map.of("text", retrievalQuery)
+        ));
 
         EmbeddingSearchRequest request = buildResumeSearchRequest(queryEmbedding, buildDynamicResumeFilter(normalizedUserId, constraints), vectorMaxResults, 0.7);
         //向量召回
-        List<EmbeddingMatch<TextSegment>> vectorMatches = searchVectorMatchesWithFallback(request, userIdKey, constraints);
+        TimedValue<List<EmbeddingMatch<TextSegment>>> vectorStep = timeValue("vector_retrieval", () -> searchVectorMatchesWithFallback(request, userIdKey, constraints));
+        List<EmbeddingMatch<TextSegment>> vectorMatches = vectorStep.value();
+        steps.add(new TraceStep(
+                "vector_retrieval",
+                vectorStep.elapsedMillis(),
+                null,
+                Map.of(
+                        "topN", vectorMaxResults,
+                        "returned", vectorMatches.size(),
+                        "matches", toVectorTraceItems(vectorMatches)
+                )
+        ));
         //关键字召回
-        List<KeywordHit> keywordHits = searchKeywordHits(normalizedUserId, retrievalQuery, keywordMaxResults);
+        TimedValue<List<KeywordHit>> keywordStep = timeValue("keyword_retrieval", () -> searchKeywordHits(normalizedUserId, retrievalQuery, keywordMaxResults));
+        List<KeywordHit> keywordHits = keywordStep.value();
+        steps.add(new TraceStep(
+                "keyword_retrieval",
+                keywordStep.elapsedMillis(),
+                null,
+                Map.of(
+                        "topN", keywordMaxResults,
+                        "returned", keywordHits.size(),
+                        "hits", keywordHits
+                )
+        ));
 
-        List<String> parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, retrievalQuery, constraints, parentContextLimit, scoreCliffMinContexts);
-        if (parentContexts.isEmpty()) {
+        List<EmbeddingMatch<TextSegment>> initialVectorMatches = vectorMatches;
+        TimedValue<HybridContextResult> hybridStep = timeValue("rerank_and_token_funnel", () -> collectHybridParentContexts(initialVectorMatches, keywordHits, retrievalQuery, constraints, parentContextLimit, scoreCliffMinContexts));
+        HybridContextResult hybridResult = hybridStep.value();
+        steps.add(new TraceStep("rerank_and_token_funnel", hybridStep.elapsedMillis(), null, hybridResult.traceData()));
+        if (hybridResult.contexts().isEmpty()) {
             EmbeddingSearchRequest relaxedRequest = buildResumeSearchRequest(queryEmbedding, buildBaseResumeFilter(normalizedUserId), vectorMaxResults, 0.7);
-            vectorMatches = searchVectorMatchesWithFallback(relaxedRequest, userIdKey, ResumeFilterConstraints.empty());
-            parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, retrievalQuery, ResumeFilterConstraints.empty(), parentContextLimit, scoreCliffMinContexts);
-            if (parentContexts.isEmpty()) {
-                return "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
+            TimedValue<List<EmbeddingMatch<TextSegment>>> relaxedVectorStep = timeValue("vector_retrieval_relaxed", () -> searchVectorMatchesWithFallback(relaxedRequest, userIdKey, ResumeFilterConstraints.empty()));
+            vectorMatches = relaxedVectorStep.value();
+            steps.add(new TraceStep(
+                    "vector_retrieval_relaxed",
+                    relaxedVectorStep.elapsedMillis(),
+                    null,
+                    Map.of(
+                            "topN", vectorMaxResults,
+                            "returned", vectorMatches.size(),
+                            "matches", toVectorTraceItems(vectorMatches)
+                    )
+            ));
+            List<EmbeddingMatch<TextSegment>> relaxedVectorMatches = vectorMatches;
+            TimedValue<HybridContextResult> relaxedHybridStep = timeValue("rerank_and_token_funnel_relaxed", () -> collectHybridParentContexts(relaxedVectorMatches, keywordHits, retrievalQuery, ResumeFilterConstraints.empty(), parentContextLimit, scoreCliffMinContexts));
+            hybridResult = relaxedHybridStep.value();
+            steps.add(new TraceStep("rerank_and_token_funnel_relaxed", relaxedHybridStep.elapsedMillis(), null, hybridResult.traceData()));
+            if (hybridResult.contexts().isEmpty()) {
+                String answer = "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
+                ragStopWatch.stop();
+                return new QueryResumeExecution(answer, ragStopWatch.getTotalTimeMillis());
             }
         }
 
-        String mergedContext = String.join("\n\n---\n\n", parentContexts);
+        String mergedContext = String.join("\n\n---\n\n", hybridResult.contexts());
         String outputInstruction = horizontalCompare ? """
                 输出格式要求：
                 1. 必须使用 Markdown 表格进行横向对比。
@@ -660,7 +760,18 @@ public class DocumentLoader {
                 【问题】
                 %s
                 """.formatted(outputInstruction, mergedContext, originalQuery);
-        return chatLanguageModel.chat(prompt);
+        TimedValue<String> answerStep = timeValue("chat_model", () -> chatLanguageModel.chat(prompt));
+        steps.add(new TraceStep(
+                "final_answer",
+                answerStep.elapsedMillis(),
+                estimateTokenCount(prompt, answerStep.value()),
+                Map.of(
+                        "promptCharacters", prompt.length(),
+                        "contextCount", hybridResult.contexts().size()
+                )
+        ));
+        ragStopWatch.stop();
+        return new QueryResumeExecution(answerStep.value(), ragStopWatch.getTotalTimeMillis());
     }
 
     private EmbeddingSearchRequest buildResumeSearchRequest(Embedding queryEmbedding, Filter filter, int maxResults, double minScore) {
@@ -1045,12 +1156,12 @@ public class DocumentLoader {
     /**
      * 将向量召回与关键词召回融合后，按父块去重并输出可直接拼接到 Prompt 的上下文片段。
      */
-    private List<String> collectHybridParentContexts(List<EmbeddingMatch<TextSegment>> vectorMatches,
-                                                     List<KeywordHit> keywordHits,
-                                                     String query,
-                                                     ResumeFilterConstraints constraints,
-                                                     int maxParents,
-                                                     int scoreCliffMinContexts) {
+    private HybridContextResult collectHybridParentContexts(List<EmbeddingMatch<TextSegment>> vectorMatches,
+                                                           List<KeywordHit> keywordHits,
+                                                           String query,
+                                                           ResumeFilterConstraints constraints,
+                                                           int maxParents,
+                                                           int scoreCliffMinContexts) {
         Map<String, ParentCandidate> candidates = new LinkedHashMap<>();
         //关键字信息
         HeuristicScoringContext scoringContext = buildHeuristicScoringContext(query, constraints);
@@ -1118,6 +1229,7 @@ public class DocumentLoader {
         List<ParentCandidate> scoredCandidates = candidates.values().stream()
                 .map(candidate -> scoreParentCandidate(candidate, parentContentById, scoringContext))
                 .toList();
+        List<RankTraceItem> beforeRank = toRankTraceItems(candidates.values().stream().toList());
         boolean hasKeywordMatchedCandidate = scoredCandidates.stream().anyMatch(ParentCandidate::keywordHit);
         List<ParentCandidate> candidatesForAnswer = hasKeywordMatchedCandidate
                 ? scoredCandidates.stream().filter(ParentCandidate::keywordHit).toList()
@@ -1127,8 +1239,10 @@ public class DocumentLoader {
                 .sorted(Comparator.comparingDouble(ParentCandidate::score).reversed())
                 .toList();
         List<ParentCandidate> selectedCandidates = truncateAfterScoreCliff(sortedCandidates, maxParents, scoreCliffMinContexts);
+        List<RankTraceItem> afterRank = toRankTraceItems(sortedCandidates);
+        List<RankTraceItem> selectedRank = toRankTraceItems(selectedCandidates);
 
-        return selectedCandidates.stream()
+        List<String> contexts = selectedCandidates.stream()
                 .map(candidate -> {
                     String type = candidate.parentType().isBlank() ? "resume" : candidate.parentType();
                     String dbContent = candidate.parentBlockId() == null ? "" : ResumeTextUtils.safe(parentContentById.get(candidate.parentBlockId()));
@@ -1141,6 +1255,60 @@ public class DocumentLoader {
                             + ", parentIndex=" + candidate.parentKey() + "】\n" + content;
                 })
                 .toList();
+        Map<String, Object> traceData = new LinkedHashMap<>();
+        traceData.put("candidateCountBeforeRerank", candidates.size());
+        traceData.put("candidateCountAfterKeywordGate", candidatesForAnswer.size());
+        traceData.put("selectedCount", selectedCandidates.size());
+        traceData.put("truncatedCount", Math.max(0, sortedCandidates.size() - selectedCandidates.size()));
+        traceData.put("maxParents", maxParents);
+        traceData.put("scoreCliffMinContexts", scoreCliffMinContexts);
+        traceData.put("beforeRank", beforeRank);
+        traceData.put("afterRank", afterRank);
+        traceData.put("selected", selectedRank);
+        return new HybridContextResult(contexts, traceData);
+    }
+
+    private List<VectorTraceItem> toVectorTraceItems(List<EmbeddingMatch<TextSegment>> vectorMatches) {
+        if (vectorMatches == null || vectorMatches.isEmpty()) {
+            return List.of();
+        }
+        List<VectorTraceItem> items = new ArrayList<>();
+        for (int i = 0; i < vectorMatches.size(); i++) {
+            EmbeddingMatch<TextSegment> match = vectorMatches.get(i);
+            TextSegment segment = match.embedded();
+            Metadata metadata = segment == null ? null : segment.metadata();
+            items.add(new VectorTraceItem(
+                    i + 1,
+                    match.score(),
+                    metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("resumeId")),
+                    metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("candidateName")),
+                    metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("parentIndex")),
+                    metadata == null ? "" : ResumeTextUtils.safe(metadata.getString("parentType")),
+                    segment == null ? "" : limitText(ResumeTextUtils.safe(segment.text()), 160)
+            ));
+        }
+        return items;
+    }
+
+    private List<RankTraceItem> toRankTraceItems(List<ParentCandidate> candidates) {
+        if (candidates == null || candidates.isEmpty()) {
+            return List.of();
+        }
+        List<RankTraceItem> items = new ArrayList<>();
+        for (int i = 0; i < candidates.size(); i++) {
+            ParentCandidate candidate = candidates.get(i);
+            items.add(new RankTraceItem(
+                    i + 1,
+                    candidate.parentKey(),
+                    candidate.resumeId(),
+                    candidate.candidateName(),
+                    candidate.fileName(),
+                    candidate.score(),
+                    candidate.vectorHit(),
+                    candidate.keywordHit()
+            ));
+        }
+        return items;
     }
 
     private List<ParentCandidate> truncateAfterScoreCliff(List<ParentCandidate> sortedCandidates,
@@ -1622,9 +1790,64 @@ public class DocumentLoader {
         return PARENT_BLOCK_CACHE_KEY_PREFIX + parentBlockId;
     }
 
+    private <T> TimedValue<T> timeValue(String taskName, Supplier<T> supplier) {
+        StopWatch stopWatch = new StopWatch();
+        stopWatch.start(taskName);
+        T value;
+        try {
+            value = supplier.get();
+        } finally {
+            stopWatch.stop();
+        }
+        return new TimedValue<>(value, stopWatch.getTotalTimeMillis());
+    }
+
+    private long sumElapsedMillis(List<TraceStep> steps) {
+        if (steps == null || steps.isEmpty()) {
+            return 0L;
+        }
+        return steps.stream().mapToLong(TraceStep::elapsedMillis).sum();
+    }
+
+    private Integer estimateTokenCount(String prompt, String answer) {
+        int chars = ResumeTextUtils.safe(prompt).length() + ResumeTextUtils.safe(answer).length();
+        if (chars <= 0) {
+            return 0;
+        }
+        return Math.max(1, (int) Math.ceil(chars / 3.2d));
+    }
+
+    private String limitText(String value, int limit) {
+        String safe = ResumeTextUtils.safe(value);
+        if (safe.length() <= limit) {
+            return safe;
+        }
+        return safe.substring(0, limit);
+    }
+
+    private record TimedValue<T>(
+            T value,
+            long elapsedMillis
+    ) {
+    }
+
+    private record QueryResumeExecution(
+            String answer,
+            long totalElapsedMillis
+    ) {
+    }
+
+    private record HybridContextResult(
+            List<String> contexts,
+            Map<String, Object> traceData
+    ) {
+    }
+
+    //父块
     private record ParentBlock(String type, String content) {
     }
 
+    //父块候选内容
     private record ParentCandidate(
             String parentKey,
             String parentType,
@@ -1640,6 +1863,7 @@ public class DocumentLoader {
     ) {
     }
 
+    //启发式评分所需内容
     private record HeuristicScoringContext(
             List<String> queryTerms,
             List<String> requiredKeywords,
@@ -1660,6 +1884,29 @@ public class DocumentLoader {
                               String resumeId,
                               String candidateName,
                               String fileName) {
+    }
+
+    private record VectorTraceItem(
+            int rank,
+            double score,
+            String resumeId,
+            String candidateName,
+            String parentIndex,
+            String parentType,
+            String textPreview
+    ) {
+    }
+
+    private record RankTraceItem(
+            int rank,
+            String parentKey,
+            String resumeId,
+            String candidateName,
+            String fileName,
+            double score,
+            boolean vectorHit,
+            boolean keywordHit
+    ) {
     }
 
     /**
@@ -1767,6 +2014,32 @@ public class DocumentLoader {
             Long resumeId,
             String candidateName,
             boolean deleted
+    ) {
+    }
+
+    public record QueryResumeResult(
+            String answer,
+            ResumeQueryTrace trace
+    ) {
+    }
+
+    public record ResumeQueryTrace(
+            String traceId,
+            String userId,
+            String userIdKey,
+            String originalQuery,
+            String rewrittenQuery,
+            String intent,
+            long totalElapsedMillis,
+            List<TraceStep> steps
+    ) {
+    }
+
+    public record TraceStep(
+            String name,
+            long elapsedMillis,
+            Integer tokenCount,
+            Map<String, Object> data
     ) {
     }
 

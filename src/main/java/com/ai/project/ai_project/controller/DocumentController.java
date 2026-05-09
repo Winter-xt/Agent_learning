@@ -58,9 +58,10 @@ public class DocumentController {
     }
 
     @GetMapping("/query-resume")
-    public String queryResume(@RequestParam String query) {
+    public DocumentLoader.QueryResumeResult queryResume(@RequestParam(defaultValue = "default-user") String userId,
+                                                        @RequestParam String query) {
         try {
-            return documentLoader.queryResume(DEFAULT_USER_ID, query);
+            return documentLoader.queryResume(userId, query);
         } catch (IllegalArgumentException e) {
             throw new ResponseStatusException(BAD_REQUEST, e.getMessage(), e);
         }
