@@ -12,6 +12,6 @@ public final class IntentRoutingUtils {
     }
 
     public static boolean shouldUseRag(Intent intent) {
-        return intent == Intent.RESUME_QUERY;
+        return intent == Intent.RESUME_QUERY || intent == Intent.HORIZONTAL_COMPARE;
     }
 }

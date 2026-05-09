@@ -67,8 +67,15 @@ public class DocumentLoader {
     private static final int RESUME_KEYWORD_TEXT_LIMIT = 12000;
     private static final int RESUME_QUERY_REWRITE_MAX_LENGTH = 500;
     private static final int SCORE_CLIFF_MIN_CONTEXTS = 1;
+    private static final int HORIZONTAL_COMPARE_SCORE_CLIFF_MIN_CONTEXTS = 4;
     private static final double SCORE_CLIFF_RETAIN_RATIO = 0.45d;
     private static final double SCORE_CLIFF_MIN_GAP = 0.12d;
+    private static final int RESUME_VECTOR_MAX_RESULTS = 50;
+    private static final int HORIZONTAL_COMPARE_VECTOR_MAX_RESULTS = 80;
+    private static final int RESUME_KEYWORD_MAX_RESULTS = 12;
+    private static final int HORIZONTAL_COMPARE_KEYWORD_MAX_RESULTS = 24;
+    private static final int RESUME_PARENT_CONTEXTS = 4;
+    private static final int HORIZONTAL_COMPARE_PARENT_CONTEXTS = 8;
     private static final DocumentSplitter CHILD_SPLITTER = DocumentSplitters.recursive(200, 40);
     private static final Pattern QUERY_TOKEN_SPLITTER = Pattern.compile("[\\s,，。！？；;:：()（）\\-_/\\.]+");
     private static final List<String> FAMOUS_SCHOOL_SIGNALS = List.of(
@@ -500,7 +507,7 @@ public class DocumentLoader {
         Intent intent = classifyIntent(query);
         if (shouldUseResumeRag(intent)) {
             String rewrittenQuery = rewriteResumeQuery(query);
-            return queryResumeWithRag(userId, query, rewrittenQuery);
+            return queryResumeWithRag(userId, query, rewrittenQuery, isHorizontalCompareIntent(intent));
         }
 
         String prompt = """
@@ -592,37 +599,43 @@ public class DocumentLoader {
      * 2) 动态构建 LangChain4j Filter 并执行向量/关键词混合召回；
      * 3) 将召回上下文交给模型生成最终答案。
      */
-    private String queryResumeWithRag(String userId, String originalQuery, String retrievalQuery) {
+    private String queryResumeWithRag(String userId, String originalQuery, String retrievalQuery, boolean horizontalCompare) {
         String normalizedUserId = ResumeTextUtils.normalizeUserId(userId);
+        int vectorMaxResults = horizontalCompare ? HORIZONTAL_COMPARE_VECTOR_MAX_RESULTS : RESUME_VECTOR_MAX_RESULTS;
+        int keywordMaxResults = horizontalCompare ? HORIZONTAL_COMPARE_KEYWORD_MAX_RESULTS : RESUME_KEYWORD_MAX_RESULTS;
+        int parentContextLimit = horizontalCompare ? HORIZONTAL_COMPARE_PARENT_CONTEXTS : RESUME_PARENT_CONTEXTS;
+        int scoreCliffMinContexts = horizontalCompare ? HORIZONTAL_COMPARE_SCORE_CLIFF_MIN_CONTEXTS : SCORE_CLIFF_MIN_CONTEXTS;
 
         //提取约束条件
         ResumeFilterConstraints constraints = extractResumeFilterConstraints(retrievalQuery);
         String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
         Embedding queryEmbedding = embeddingModel.embed(retrievalQuery).content();
 
-        EmbeddingSearchRequest request = buildResumeSearchRequest(queryEmbedding, buildDynamicResumeFilter(normalizedUserId, constraints), 50, 0.7);
+        EmbeddingSearchRequest request = buildResumeSearchRequest(queryEmbedding, buildDynamicResumeFilter(normalizedUserId, constraints), vectorMaxResults, 0.7);
         //向量召回
         List<EmbeddingMatch<TextSegment>> vectorMatches = searchVectorMatchesWithFallback(request, userIdKey, constraints);
         //关键字召回
-        List<KeywordHit> keywordHits = searchKeywordHits(normalizedUserId, retrievalQuery, 12);
+        List<KeywordHit> keywordHits = searchKeywordHits(normalizedUserId, retrievalQuery, keywordMaxResults);
 
-        List<String> parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, retrievalQuery, constraints, 4);
+        List<String> parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, retrievalQuery, constraints, parentContextLimit, scoreCliffMinContexts);
         if (parentContexts.isEmpty()) {
-            EmbeddingSearchRequest relaxedRequest = buildResumeSearchRequest(queryEmbedding, buildBaseResumeFilter(normalizedUserId), 50, 0.7);
+            EmbeddingSearchRequest relaxedRequest = buildResumeSearchRequest(queryEmbedding, buildBaseResumeFilter(normalizedUserId), vectorMaxResults, 0.7);
             vectorMatches = searchVectorMatchesWithFallback(relaxedRequest, userIdKey, ResumeFilterConstraints.empty());
-            parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, retrievalQuery, ResumeFilterConstraints.empty(), 4);
+            parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, retrievalQuery, ResumeFilterConstraints.empty(), parentContextLimit, scoreCliffMinContexts);
             if (parentContexts.isEmpty()) {
                 return "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
             }
         }
 
         String mergedContext = String.join("\n\n---\n\n", parentContexts);
-        String prompt = """
-                你是一个简历分析助手。
-                你会收到按父块去重后的简历上下文，每个父块可能由多个子块检索命中后合并而来。
-                每段上下文头部包含 resumeId、candidateName、fileName 和 downloadUrl。
-                如果问题是在找候选人，请按候选人归纳输出，多个人都符合时列出多个人，并附上对应 downloadUrl。
-                请优先理解 parentBlock 再回答，不要编造。
+        String outputInstruction = horizontalCompare ? """
+                输出格式要求：
+                1. 必须使用 Markdown 表格进行横向对比。
+                2. 表格列必须包含候选人、核心结论、关键匹配点、风险或不足、证据、下载链接。
+                3. 对比维度要对齐，同一维度在不同行中表达口径一致。
+                4. 表格后给出结论：如果证据充分，明确指出谁更匹配并说明原因；如果证据不足，不要强行排序，明确说明缺少哪些信息以及当前只能得出的有限结论。
+                5. 不要编造简历中没有的信息。
+                """ : """
                 输出格式要求：
                 1. 禁止使用 Markdown 表格（不要使用 | --- | 这种格式）。
                 2. 使用“编号列表 + 小标题”输出。
@@ -631,6 +644,14 @@ public class DocumentLoader {
                    - 结论：
                    - 证据：
                    - 下载链接：
+                """;
+        String prompt = """
+                你是一个简历分析助手。
+                你会收到按父块去重后的简历上下文，每个父块可能由多个子块检索命中后合并而来。
+                每段上下文头部包含 resumeId、candidateName、fileName 和 downloadUrl。
+                如果问题是在找候选人，请按候选人归纳输出，多个人都符合时列出多个人，并附上对应 downloadUrl。
+                请优先理解 parentBlock 再回答，不要编造。
+                %s
                 如果简历中没有相关信息，请明确回答：未在该用户简历中找到相关信息。
 
                 【简历上下文】
@@ -638,7 +659,7 @@ public class DocumentLoader {
 
                 【问题】
                 %s
-                """.formatted(mergedContext, originalQuery);
+                """.formatted(outputInstruction, mergedContext, originalQuery);
         return chatLanguageModel.chat(prompt);
     }
 
@@ -928,7 +949,11 @@ public class DocumentLoader {
     }
 
     private boolean shouldUseResumeRag(Intent intent) {
-        return intent == Intent.RESUME_QUERY;
+        return intent == Intent.RESUME_QUERY || intent == Intent.HORIZONTAL_COMPARE;
+    }
+
+    private boolean isHorizontalCompareIntent(Intent intent) {
+        return intent == Intent.HORIZONTAL_COMPARE;
     }
 
     private List<EmbeddingMatch<TextSegment>> searchVectorMatchesWithFallback(EmbeddingSearchRequest request,
@@ -946,7 +971,7 @@ public class DocumentLoader {
         // Fallback for schema/version drift: retrieve without filter and apply metadata filtering in JVM.
         EmbeddingSearchRequest fallbackRequest = EmbeddingSearchRequest.builder()
                 .queryEmbedding(request.queryEmbedding())
-                .maxResults(50)
+                .maxResults(request.maxResults())
                 .minScore(0.0)
                 .build();
         return embeddingStore.search(fallbackRequest).matches().stream()
@@ -1024,7 +1049,8 @@ public class DocumentLoader {
                                                      List<KeywordHit> keywordHits,
                                                      String query,
                                                      ResumeFilterConstraints constraints,
-                                                     int maxParents) {
+                                                     int maxParents,
+                                                     int scoreCliffMinContexts) {
         Map<String, ParentCandidate> candidates = new LinkedHashMap<>();
         //关键字信息
         HeuristicScoringContext scoringContext = buildHeuristicScoringContext(query, constraints);
@@ -1100,7 +1126,7 @@ public class DocumentLoader {
         List<ParentCandidate> sortedCandidates = candidatesForAnswer.stream()
                 .sorted(Comparator.comparingDouble(ParentCandidate::score).reversed())
                 .toList();
-        List<ParentCandidate> selectedCandidates = truncateAfterScoreCliff(sortedCandidates, maxParents);
+        List<ParentCandidate> selectedCandidates = truncateAfterScoreCliff(sortedCandidates, maxParents, scoreCliffMinContexts);
 
         return selectedCandidates.stream()
                 .map(candidate -> {
@@ -1117,15 +1143,18 @@ public class DocumentLoader {
                 .toList();
     }
 
-    private List<ParentCandidate> truncateAfterScoreCliff(List<ParentCandidate> sortedCandidates, int maxParents) {
+    private List<ParentCandidate> truncateAfterScoreCliff(List<ParentCandidate> sortedCandidates,
+                                                          int maxParents,
+                                                          int scoreCliffMinContexts) {
         if (sortedCandidates == null || sortedCandidates.isEmpty() || maxParents <= 0) {
             return List.of();
         }
         List<ParentCandidate> selected = new ArrayList<>();
         int upperBound = Math.min(maxParents, sortedCandidates.size());
+        int minContexts = Math.max(1, scoreCliffMinContexts);
         for (int i = 0; i < upperBound; i++) {
             ParentCandidate current = sortedCandidates.get(i);
-            if (i >= SCORE_CLIFF_MIN_CONTEXTS && isScoreCliff(sortedCandidates.get(i - 1).score(), current.score())) {
+            if (i >= minContexts && isScoreCliff(sortedCandidates.get(i - 1).score(), current.score())) {
                 break;
             }
             selected.add(current);
