@@ -65,6 +65,7 @@ public class DocumentLoader {
     private static final String PARENT_BLOCK_CACHE_KEY_PREFIX = "resume:parent:block:";
     private static final int PARENT_BLOCK_CACHE_TTL_SECONDS = 24 * 60 * 60;
     private static final int RESUME_KEYWORD_TEXT_LIMIT = 12000;
+    private static final int RESUME_QUERY_REWRITE_MAX_LENGTH = 500;
     private static final DocumentSplitter CHILD_SPLITTER = DocumentSplitters.recursive(200, 40);
     private static final Pattern QUERY_TOKEN_SPLITTER = Pattern.compile("[\\s,，。！？；;:：()（）\\-_/\\.]+");
     private static final List<String> FAMOUS_SCHOOL_SIGNALS = List.of(
@@ -495,7 +496,8 @@ public class DocumentLoader {
         //意图识别，判断用户的问题是否需要 RAG
         Intent intent = classifyIntent(query);
         if (shouldUseResumeRag(intent)) {
-            return queryResumeWithRag(userId, query);
+            String rewrittenQuery = rewriteResumeQuery(query);
+            return queryResumeWithRag(userId, query, rewrittenQuery);
         }
 
         String prompt = """
@@ -587,25 +589,25 @@ public class DocumentLoader {
      * 2) 动态构建 LangChain4j Filter 并执行向量/关键词混合召回；
      * 3) 将召回上下文交给模型生成最终答案。
      */
-    private String queryResumeWithRag(String userId, String query) {
+    private String queryResumeWithRag(String userId, String originalQuery, String retrievalQuery) {
         String normalizedUserId = ResumeTextUtils.normalizeUserId(userId);
 
         //提取约束条件
-        ResumeFilterConstraints constraints = extractResumeFilterConstraints(query);
+        ResumeFilterConstraints constraints = extractResumeFilterConstraints(retrievalQuery);
         String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
-        Embedding queryEmbedding = embeddingModel.embed(query).content();
+        Embedding queryEmbedding = embeddingModel.embed(retrievalQuery).content();
 
         EmbeddingSearchRequest request = buildResumeSearchRequest(queryEmbedding, buildDynamicResumeFilter(normalizedUserId, constraints), 50, 0.7);
         //向量召回
         List<EmbeddingMatch<TextSegment>> vectorMatches = searchVectorMatchesWithFallback(request, userIdKey, constraints);
         //关键字召回
-        List<KeywordHit> keywordHits = searchKeywordHits(normalizedUserId, query, 12);
+        List<KeywordHit> keywordHits = searchKeywordHits(normalizedUserId, retrievalQuery, 12);
 
-        List<String> parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, query, constraints, 4);
+        List<String> parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, retrievalQuery, constraints, 4);
         if (parentContexts.isEmpty()) {
             EmbeddingSearchRequest relaxedRequest = buildResumeSearchRequest(queryEmbedding, buildBaseResumeFilter(normalizedUserId), 50, 0.7);
             vectorMatches = searchVectorMatchesWithFallback(relaxedRequest, userIdKey, ResumeFilterConstraints.empty());
-            parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, query, ResumeFilterConstraints.empty(), 4);
+            parentContexts = collectHybridParentContexts(vectorMatches, keywordHits, retrievalQuery, ResumeFilterConstraints.empty(), 4);
             if (parentContexts.isEmpty()) {
                 return "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
             }
@@ -633,7 +635,7 @@ public class DocumentLoader {
 
                 【问题】
                 %s
-                """.formatted(mergedContext, query);
+                """.formatted(mergedContext, originalQuery);
         return chatLanguageModel.chat(prompt);
     }
 
@@ -697,6 +699,36 @@ public class DocumentLoader {
             merged = new And(merged, filters.get(i));
         }
         return merged;
+    }
+
+    /**
+     * RAG 前对用户查询做检索向改写，失败或结果异常时回退原问题。
+     */
+    private String rewriteResumeQuery(String query) {
+        try {
+            String rewritten = normalizeRewrittenQuery(metadataFilterAiService.rewriteResumeQuery(query));
+            return rewritten.isBlank() ? ResumeTextUtils.safe(query) : rewritten;
+        } catch (Exception ignored) {
+            return ResumeTextUtils.safe(query);
+        }
+    }
+
+    private String normalizeRewrittenQuery(String raw) {
+        String value = ResumeTextUtils.safe(raw)
+                .replaceAll("(?i)^```[a-z]*", "")
+                .replaceAll("```$", "")
+                .replaceAll("[\\r\\n\\t]+", " ")
+                .replaceAll("\\s{2,}", " ")
+                .trim();
+        if ((value.startsWith("\"") && value.endsWith("\""))
+                || (value.startsWith("'") && value.endsWith("'"))
+                || (value.startsWith("“") && value.endsWith("”"))) {
+            value = value.substring(1, value.length() - 1).trim();
+        }
+        if (value.length() > RESUME_QUERY_REWRITE_MAX_LENGTH) {
+            value = value.substring(0, RESUME_QUERY_REWRITE_MAX_LENGTH).trim();
+        }
+        return value;
     }
 
     /**

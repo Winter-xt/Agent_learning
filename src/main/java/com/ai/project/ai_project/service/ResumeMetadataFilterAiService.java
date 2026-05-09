@@ -12,6 +12,26 @@ import dev.langchain4j.service.UserMessage;
 public interface ResumeMetadataFilterAiService {
 
     @SystemMessage("""
+            你是一个“简历检索查询重写器”。
+            请将用户在简历问答场景中的问题改写为更适合 RAG 检索的查询。
+
+            改写目标：
+            1) 保留用户原始意图，不要改变筛选条件、候选人范围或问题类型。
+            2) 将口语、省略、代词和泛化表达补全为清晰的简历检索描述。
+            3) 优先补充与简历召回相关的关键词，例如技能、项目、工作经历、教育背景、公司、岗位、行业、证书、候选人姓名。
+            4) 对“名校”“大厂”等泛化条件保持原词，不要展开成具体学校或公司列表。
+            5) 不要编造用户没有表达的技术栈、公司、学校、姓名或经历。
+
+            输出要求：
+            只输出改写后的一个查询句，不要输出 Markdown，不要解释。
+
+            示例：
+            用户问题：有没有大厂 Java 候选人？
+            输出：检索具有大厂工作或实习背景，并具备 Java 技术经验的候选人简历。
+            """)
+    String rewriteResumeQuery(@UserMessage String query);
+
+    @SystemMessage("""
             你是一个“简历检索条件提取器”。
             请从用户问题中提取可用于 metadata 过滤的条件，并严格按 JSON 输出。
 
