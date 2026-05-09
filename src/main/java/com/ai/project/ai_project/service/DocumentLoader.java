@@ -66,6 +66,9 @@ public class DocumentLoader {
     private static final int PARENT_BLOCK_CACHE_TTL_SECONDS = 24 * 60 * 60;
     private static final int RESUME_KEYWORD_TEXT_LIMIT = 12000;
     private static final int RESUME_QUERY_REWRITE_MAX_LENGTH = 500;
+    private static final int SCORE_CLIFF_MIN_CONTEXTS = 1;
+    private static final double SCORE_CLIFF_RETAIN_RATIO = 0.45d;
+    private static final double SCORE_CLIFF_MIN_GAP = 0.12d;
     private static final DocumentSplitter CHILD_SPLITTER = DocumentSplitters.recursive(200, 40);
     private static final Pattern QUERY_TOKEN_SPLITTER = Pattern.compile("[\\s,，。！？；;:：()（）\\-_/\\.]+");
     private static final List<String> FAMOUS_SCHOOL_SIGNALS = List.of(
@@ -1094,9 +1097,12 @@ public class DocumentLoader {
                 ? scoredCandidates.stream().filter(ParentCandidate::keywordHit).toList()
                 : scoredCandidates;
 
-        return candidatesForAnswer.stream()
+        List<ParentCandidate> sortedCandidates = candidatesForAnswer.stream()
                 .sorted(Comparator.comparingDouble(ParentCandidate::score).reversed())
-                .limit(maxParents)
+                .toList();
+        List<ParentCandidate> selectedCandidates = truncateAfterScoreCliff(sortedCandidates, maxParents);
+
+        return selectedCandidates.stream()
                 .map(candidate -> {
                     String type = candidate.parentType().isBlank() ? "resume" : candidate.parentType();
                     String dbContent = candidate.parentBlockId() == null ? "" : ResumeTextUtils.safe(parentContentById.get(candidate.parentBlockId()));
@@ -1109,6 +1115,31 @@ public class DocumentLoader {
                             + ", parentIndex=" + candidate.parentKey() + "】\n" + content;
                 })
                 .toList();
+    }
+
+    private List<ParentCandidate> truncateAfterScoreCliff(List<ParentCandidate> sortedCandidates, int maxParents) {
+        if (sortedCandidates == null || sortedCandidates.isEmpty() || maxParents <= 0) {
+            return List.of();
+        }
+        List<ParentCandidate> selected = new ArrayList<>();
+        int upperBound = Math.min(maxParents, sortedCandidates.size());
+        for (int i = 0; i < upperBound; i++) {
+            ParentCandidate current = sortedCandidates.get(i);
+            if (i >= SCORE_CLIFF_MIN_CONTEXTS && isScoreCliff(sortedCandidates.get(i - 1).score(), current.score())) {
+                break;
+            }
+            selected.add(current);
+        }
+        return selected;
+    }
+
+    private boolean isScoreCliff(double previousScore, double currentScore) {
+        if (previousScore <= 0.0d) {
+            return false;
+        }
+        double scoreGap = previousScore - currentScore;
+        return scoreGap >= SCORE_CLIFF_MIN_GAP
+                && currentScore <= previousScore * SCORE_CLIFF_RETAIN_RATIO;
     }
 
     private ParentCandidate scoreParentCandidate(ParentCandidate candidate,
