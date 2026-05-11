@@ -16,6 +16,9 @@ import dev.langchain4j.data.document.splitter.DocumentSplitters;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.StreamingChatModel;
+import dev.langchain4j.model.chat.response.ChatResponse;
+import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.output.Response;
 import dev.langchain4j.service.AiServices;
@@ -50,6 +53,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -94,6 +98,7 @@ public class DocumentLoader {
     );
 
     private final ChatModel chatLanguageModel;
+    private final StreamingChatModel streamingChatLanguageModel;
     private final EmbeddingModel embeddingModel;
     private final EmbeddingStore<TextSegment> embeddingStore;
     private final UnifiedJedis unifiedJedis;
@@ -110,6 +115,7 @@ public class DocumentLoader {
     private final ObjectMapper objectMapper;
 
     public DocumentLoader(ChatModel chatLanguageModel,
+                          StreamingChatModel streamingChatLanguageModel,
                           EmbeddingModel embeddingModel,
                           EmbeddingStore<TextSegment> embeddingStore,
                           UnifiedJedis unifiedJedis,
@@ -121,6 +127,7 @@ public class DocumentLoader {
                           @org.springframework.beans.factory.annotation.Value("${app.vector.index-name:talent-index-v4}") String vectorIndexName,
                           @org.springframework.beans.factory.annotation.Value("${app.resume.storage-dir:${user.home}/.ai_project/resumes}") String resumeStorageDir) {
         this.chatLanguageModel = chatLanguageModel;
+        this.streamingChatLanguageModel = streamingChatLanguageModel;
         this.embeddingModel = embeddingModel;
         this.embeddingStore = embeddingStore;
         this.unifiedJedis = unifiedJedis;
@@ -562,6 +569,93 @@ public class DocumentLoader {
         return new QueryResumeResult(answerStep.value(), trace);
     }
 
+    public void queryResumeStream(String userId,
+                                  String query,
+                                  Consumer<String> tokenConsumer,
+                                  Consumer<ResumeQueryTrace> traceConsumer,
+                                  Runnable completeCallback,
+                                  Consumer<Throwable> errorConsumer) {
+        validateResumeQueryParams(userId, query);
+
+        String traceId = UUID.randomUUID().toString();
+        String normalizedUserId = ResumeTextUtils.normalizeUserId(userId);
+        String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
+        List<TraceStep> steps = new ArrayList<>();
+
+        try {
+            TimedValue<Intent> intentStep = timeValue("intent_classification", () -> classifyIntent(query));
+            Intent intent = intentStep.value();
+            steps.add(new TraceStep(
+                    "intent_classification",
+                    intentStep.elapsedMillis(),
+                    null,
+                    Map.of("intent", intent.name())
+            ));
+
+            String rewrittenQuery = ResumeTextUtils.safe(query);
+            ResumeAnswerPreparation preparation;
+            if (shouldUseResumeRag(intent)) {
+                TimedValue<String> rewriteStep = timeValue("query_rewrite", () -> rewriteResumeQuery(query));
+                rewrittenQuery = rewriteStep.value();
+                steps.add(new TraceStep(
+                        "query_rewrite",
+                        rewriteStep.elapsedMillis(),
+                        null,
+                        Map.of(
+                                "before", ResumeTextUtils.safe(query),
+                                "after", rewrittenQuery
+                        )
+                ));
+                preparation = prepareResumeRagAnswer(normalizedUserId, query, rewrittenQuery, isHorizontalCompareIntent(intent), steps);
+            } else {
+                String prompt = """
+                        你是一个招聘助手。
+                        当前用户在“简历问答”通道提问，但该问题更偏向闲聊或意图不明确。
+                        请先简短回应用户，并引导用户提出与简历检索相关的问题，例如：
+                        - 候选人有哪些项目经验？
+                        - 候选人是否有 Java/Spring 经验？
+                        输出时不要使用 Markdown 表格，保持自然段或列表即可。
+
+                        用户问题：%s
+                        """.formatted(query);
+                preparation = new ResumeAnswerPreparation(prompt, "", 0L, 0);
+            }
+
+            String finalRewrittenQuery = rewrittenQuery;
+            Intent finalIntent = intent;
+            if (!preparation.immediateAnswer().isBlank()) {
+                String answer = preparation.immediateAnswer();
+                tokenConsumer.accept(answer);
+                steps.add(new TraceStep(
+                        "final_answer",
+                        0L,
+                        estimateTokenCount("", answer),
+                        Map.of("mode", "immediate")
+                ));
+                ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, finalRewrittenQuery, finalIntent.name(), sumElapsedMillis(steps), steps);
+                resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, finalRewrittenQuery, finalIntent.name(), answer, trace);
+                traceConsumer.accept(trace);
+                completeCallback.run();
+                return;
+            }
+
+            streamResumeAnswer(
+                    preparation,
+                    tokenConsumer,
+                    answer -> {
+                        ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, finalRewrittenQuery, finalIntent.name(), sumElapsedMillis(steps), steps);
+                        resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, finalRewrittenQuery, finalIntent.name(), answer, trace);
+                        traceConsumer.accept(trace);
+                        completeCallback.run();
+                    },
+                    errorConsumer,
+                    steps
+            );
+        } catch (Exception e) {
+            errorConsumer.accept(e);
+        }
+    }
+
     public ResumeDownload downloadResume(String userId, Long resumeId) throws IOException {
         if (resumeId == null || resumeId <= 0) {
             throw new IllegalArgumentException("resumeId 无效");
@@ -643,6 +737,15 @@ public class DocumentLoader {
                                                     String retrievalQuery,
                                                     boolean horizontalCompare,
                                                     List<TraceStep> steps) {
+        ResumeAnswerPreparation preparation = prepareResumeRagAnswer(normalizedUserId, originalQuery, retrievalQuery, horizontalCompare, steps);
+        return completeResumeAnswer(preparation, steps);
+    }
+
+    private ResumeAnswerPreparation prepareResumeRagAnswer(String normalizedUserId,
+                                                           String originalQuery,
+                                                           String retrievalQuery,
+                                                           boolean horizontalCompare,
+                                                           List<TraceStep> steps) {
         StopWatch ragStopWatch = new StopWatch("resume-rag-query");
         ragStopWatch.start("total");
         int vectorMaxResults = horizontalCompare ? HORIZONTAL_COMPARE_VECTOR_MAX_RESULTS : RESUME_VECTOR_MAX_RESULTS;
@@ -723,7 +826,7 @@ public class DocumentLoader {
             if (hybridResult.contexts().isEmpty()) {
                 String answer = "未检索到该用户的简历片段。请确认 userId 与上传时一致，并重新上传一次简历后再查询。";
                 ragStopWatch.stop();
-                return new QueryResumeExecution(answer, ragStopWatch.getTotalTimeMillis());
+                return new ResumeAnswerPreparation("", answer, ragStopWatch.getTotalTimeMillis(), 0);
             }
         }
 
@@ -760,18 +863,72 @@ public class DocumentLoader {
                 【问题】
                 %s
                 """.formatted(outputInstruction, mergedContext, originalQuery);
-        TimedValue<String> answerStep = timeValue("chat_model", () -> chatLanguageModel.chat(prompt));
+        ragStopWatch.stop();
+        return new ResumeAnswerPreparation(prompt, "", ragStopWatch.getTotalTimeMillis(), hybridResult.contexts().size());
+    }
+
+    private QueryResumeExecution completeResumeAnswer(ResumeAnswerPreparation preparation, List<TraceStep> steps) {
+        if (!preparation.immediateAnswer().isBlank()) {
+            return new QueryResumeExecution(preparation.immediateAnswer(), preparation.preparationElapsedMillis() + sumElapsedMillis(steps));
+        }
+        TimedValue<String> answerStep = timeValue("chat_model", () -> chatLanguageModel.chat(preparation.prompt()));
         steps.add(new TraceStep(
                 "final_answer",
                 answerStep.elapsedMillis(),
-                estimateTokenCount(prompt, answerStep.value()),
+                estimateTokenCount(preparation.prompt(), answerStep.value()),
                 Map.of(
-                        "promptCharacters", prompt.length(),
-                        "contextCount", hybridResult.contexts().size()
+                        "promptCharacters", preparation.prompt().length(),
+                        "contextCount", preparation.contextCount()
                 )
         ));
-        ragStopWatch.stop();
-        return new QueryResumeExecution(answerStep.value(), ragStopWatch.getTotalTimeMillis());
+        return new QueryResumeExecution(answerStep.value(), sumElapsedMillis(steps));
+    }
+
+    private void streamResumeAnswer(ResumeAnswerPreparation preparation,
+                                    Consumer<String> tokenConsumer,
+                                    Consumer<String> completeConsumer,
+                                    Consumer<Throwable> errorConsumer,
+                                    List<TraceStep> steps) {
+        StopWatch stopWatch = new StopWatch();
+        stopWatch.start("chat_model_stream");
+        StringBuilder answer = new StringBuilder();
+        streamingChatLanguageModel.chat(preparation.prompt(), new StreamingChatResponseHandler() {
+            @Override
+            public void onPartialResponse(String partialResponse) {
+                String partial = ResumeTextUtils.safe(partialResponse);
+                if (!partial.isBlank()) {
+                    answer.append(partial);
+                    tokenConsumer.accept(partial);
+                }
+            }
+
+            @Override
+            public void onCompleteResponse(ChatResponse response) {
+                stopWatch.stop();
+                Integer tokenCount = response == null || response.tokenUsage() == null
+                        ? estimateTokenCount(preparation.prompt(), answer.toString())
+                        : response.tokenUsage().totalTokenCount();
+                steps.add(new TraceStep(
+                        "final_answer",
+                        stopWatch.getTotalTimeMillis(),
+                        tokenCount,
+                        Map.of(
+                                "promptCharacters", preparation.prompt().length(),
+                                "contextCount", preparation.contextCount(),
+                                "mode", "stream"
+                        )
+                ));
+                completeConsumer.accept(answer.toString());
+            }
+
+            @Override
+            public void onError(Throwable error) {
+                if (stopWatch.isRunning()) {
+                    stopWatch.stop();
+                }
+                errorConsumer.accept(error);
+            }
+        });
     }
 
     private EmbeddingSearchRequest buildResumeSearchRequest(Embedding queryEmbedding, Filter filter, int maxResults, double minScore) {
@@ -1834,6 +1991,14 @@ public class DocumentLoader {
     private record QueryResumeExecution(
             String answer,
             long totalElapsedMillis
+    ) {
+    }
+
+    private record ResumeAnswerPreparation(
+            String prompt,
+            String immediateAnswer,
+            long preparationElapsedMillis,
+            int contextCount
     ) {
     }
 

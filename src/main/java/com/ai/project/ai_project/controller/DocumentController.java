@@ -1,6 +1,7 @@
 package com.ai.project.ai_project.controller;
 
 import com.ai.project.ai_project.service.DocumentLoader;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.ContentDisposition;
 import org.springframework.http.MediaType;
@@ -16,6 +17,7 @@ import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.server.ResponseStatusException;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -30,9 +32,11 @@ public class DocumentController {
     private static final String DEFAULT_USER_ID = "default-user";
 
     private final DocumentLoader documentLoader;
+    private final ObjectMapper objectMapper;
 
-    public DocumentController(DocumentLoader documentLoader) {
+    public DocumentController(DocumentLoader documentLoader, ObjectMapper objectMapper) {
         this.documentLoader = documentLoader;
+        this.objectMapper = objectMapper;
     }
 
     @PostMapping(value = "/upload-resume", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -57,11 +61,26 @@ public class DocumentController {
         }
     }
 
-    @GetMapping("/query-resume")
-    public DocumentLoader.QueryResumeResult queryResume(@RequestParam(defaultValue = "default-user") String userId,
-                                                        @RequestParam String query) {
+    @GetMapping(value = "/query-resume", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter queryResume(@RequestParam(defaultValue = "default-user") String userId,
+                                  @RequestParam String query) {
+        SseEmitter emitter = new SseEmitter(0L);
         try {
-            return documentLoader.queryResume(userId, query);
+            documentLoader.queryResumeStream(
+                    userId,
+                    query,
+                    token -> sendEvent(emitter, "token", token),
+                    trace -> sendJsonEvent(emitter, "trace", trace),
+                    () -> {
+                        sendEvent(emitter, "done", "[DONE]");
+                        emitter.complete();
+                    },
+                    error -> {
+                        sendEvent(emitter, "error", error.getMessage());
+                        emitter.completeWithError(error);
+                    }
+            );
+            return emitter;
         } catch (IllegalArgumentException e) {
             throw new ResponseStatusException(BAD_REQUEST, e.getMessage(), e);
         }
@@ -102,6 +121,22 @@ public class DocumentController {
             throw new ResponseStatusException(BAD_REQUEST, e.getMessage(), e);
         } catch (IOException e) {
             throw new ResponseStatusException(INTERNAL_SERVER_ERROR, "下载简历失败", e);
+        }
+    }
+
+    private void sendEvent(SseEmitter emitter, String eventName, String data) {
+        try {
+            emitter.send(SseEmitter.event().name(eventName).data(data == null ? "" : data));
+        } catch (IOException e) {
+            emitter.completeWithError(e);
+        }
+    }
+
+    private void sendJsonEvent(SseEmitter emitter, String eventName, Object data) {
+        try {
+            sendEvent(emitter, eventName, objectMapper.writeValueAsString(data));
+        } catch (Exception e) {
+            emitter.completeWithError(e);
         }
     }
 
