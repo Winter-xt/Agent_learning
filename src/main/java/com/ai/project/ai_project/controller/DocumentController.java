@@ -2,6 +2,7 @@ package com.ai.project.ai_project.controller;
 
 import com.ai.project.ai_project.service.DocumentLoader;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.ContentDisposition;
 import org.springframework.http.MediaType;
@@ -21,6 +22,8 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 
 import static org.springframework.http.HttpStatus.BAD_REQUEST;
 import static org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR;
@@ -33,10 +36,14 @@ public class DocumentController {
 
     private final DocumentLoader documentLoader;
     private final ObjectMapper objectMapper;
+    private final Executor aiTaskExecutor;
 
-    public DocumentController(DocumentLoader documentLoader, ObjectMapper objectMapper) {
+    public DocumentController(DocumentLoader documentLoader,
+                              ObjectMapper objectMapper,
+                              @Qualifier("aiTaskExecutor") Executor aiTaskExecutor) {
         this.documentLoader = documentLoader;
         this.objectMapper = objectMapper;
+        this.aiTaskExecutor = aiTaskExecutor;
     }
 
     @PostMapping(value = "/upload-resume", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -66,19 +73,23 @@ public class DocumentController {
                                   @RequestParam String query) {
         SseEmitter emitter = new SseEmitter(0L);
         try {
-            documentLoader.queryResumeStream(
-                    userId,
-                    query,
-                    token -> sendEvent(emitter, "token", token),
-                    trace -> sendJsonEvent(emitter, "trace", trace),
-                    () -> {
-                        sendEvent(emitter, "done", "[DONE]");
-                        emitter.complete();
-                    },
-                    error -> {
-                        sendEvent(emitter, "error", error.getMessage());
-                        emitter.completeWithError(error);
-                    }
+            CompletableFuture.runAsync(
+                    () -> documentLoader.queryResumeStream(
+                            userId,
+                            query,
+                            status -> sendEvent(emitter, "status", status),
+                            token -> sendEvent(emitter, "token", token),
+                            trace -> sendJsonEvent(emitter, "trace", trace),
+                            () -> {
+                                sendEvent(emitter, "done", "[DONE]");
+                                emitter.complete();
+                            },
+                            error -> {
+                                sendEvent(emitter, "error", error.getMessage());
+                                emitter.completeWithError(error);
+                            }
+                    ),
+                    aiTaskExecutor
             );
             return emitter;
         } catch (IllegalArgumentException e) {

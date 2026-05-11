@@ -571,6 +571,7 @@ public class DocumentLoader {
 
     public void queryResumeStream(String userId,
                                   String query,
+                                  Consumer<String> statusConsumer,
                                   Consumer<String> tokenConsumer,
                                   Consumer<ResumeQueryTrace> traceConsumer,
                                   Runnable completeCallback,
@@ -583,6 +584,7 @@ public class DocumentLoader {
         List<TraceStep> steps = new ArrayList<>();
 
         try {
+            statusConsumer.accept("🧭 正在识别查询意图...");
             TimedValue<Intent> intentStep = timeValue("intent_classification", () -> classifyIntent(query));
             Intent intent = intentStep.value();
             steps.add(new TraceStep(
@@ -595,6 +597,7 @@ public class DocumentLoader {
             String rewrittenQuery = ResumeTextUtils.safe(query);
             ResumeAnswerPreparation preparation;
             if (shouldUseResumeRag(intent)) {
+                statusConsumer.accept("🔍 正在重写查询...");
                 TimedValue<String> rewriteStep = timeValue("query_rewrite", () -> rewriteResumeQuery(query));
                 rewrittenQuery = rewriteStep.value();
                 steps.add(new TraceStep(
@@ -606,8 +609,9 @@ public class DocumentLoader {
                                 "after", rewrittenQuery
                         )
                 ));
-                preparation = prepareResumeRagAnswer(normalizedUserId, query, rewrittenQuery, isHorizontalCompareIntent(intent), steps);
+                preparation = prepareResumeRagAnswer(normalizedUserId, query, rewrittenQuery, isHorizontalCompareIntent(intent), steps, statusConsumer);
             } else {
+                statusConsumer.accept("💬 正在组织回复...");
                 String prompt = """
                         你是一个招聘助手。
                         当前用户在“简历问答”通道提问，但该问题更偏向闲聊或意图不明确。
@@ -634,17 +638,20 @@ public class DocumentLoader {
                 ));
                 ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, finalRewrittenQuery, finalIntent.name(), sumElapsedMillis(steps), steps);
                 resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, finalRewrittenQuery, finalIntent.name(), answer, trace);
+                statusConsumer.accept("✅ 查询完成");
                 traceConsumer.accept(trace);
                 completeCallback.run();
                 return;
             }
 
+            statusConsumer.accept("🧠 正在生成答案...");
             streamResumeAnswer(
                     preparation,
                     tokenConsumer,
                     answer -> {
                         ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, finalRewrittenQuery, finalIntent.name(), sumElapsedMillis(steps), steps);
                         resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, finalRewrittenQuery, finalIntent.name(), answer, trace);
+                        statusConsumer.accept("✅ 查询完成");
                         traceConsumer.accept(trace);
                         completeCallback.run();
                     },
@@ -737,7 +744,8 @@ public class DocumentLoader {
                                                     String retrievalQuery,
                                                     boolean horizontalCompare,
                                                     List<TraceStep> steps) {
-        ResumeAnswerPreparation preparation = prepareResumeRagAnswer(normalizedUserId, originalQuery, retrievalQuery, horizontalCompare, steps);
+        ResumeAnswerPreparation preparation = prepareResumeRagAnswer(normalizedUserId, originalQuery, retrievalQuery, horizontalCompare, steps, status -> {
+        });
         return completeResumeAnswer(preparation, steps);
     }
 
@@ -745,7 +753,8 @@ public class DocumentLoader {
                                                            String originalQuery,
                                                            String retrievalQuery,
                                                            boolean horizontalCompare,
-                                                           List<TraceStep> steps) {
+                                                           List<TraceStep> steps,
+                                                           Consumer<String> statusConsumer) {
         StopWatch ragStopWatch = new StopWatch("resume-rag-query");
         ragStopWatch.start("total");
         int vectorMaxResults = horizontalCompare ? HORIZONTAL_COMPARE_VECTOR_MAX_RESULTS : RESUME_VECTOR_MAX_RESULTS;
@@ -754,6 +763,7 @@ public class DocumentLoader {
         int scoreCliffMinContexts = horizontalCompare ? HORIZONTAL_COMPARE_SCORE_CLIFF_MIN_CONTEXTS : SCORE_CLIFF_MIN_CONTEXTS;
 
         //提取约束条件
+        statusConsumer.accept("🧩 正在提取筛选条件...");
         TimedValue<ResumeFilterConstraints> constraintsStep = timeValue("metadata_constraints", () -> extractResumeFilterConstraints(retrievalQuery));
         ResumeFilterConstraints constraints = constraintsStep.value();
         steps.add(new TraceStep(
@@ -773,8 +783,10 @@ public class DocumentLoader {
                 Map.of("text", retrievalQuery)
         ));
 
+        statusConsumer.accept("📚 正在调用知识库...");
         EmbeddingSearchRequest request = buildResumeSearchRequest(queryEmbedding, buildDynamicResumeFilter(normalizedUserId, constraints), vectorMaxResults, 0.7);
         //向量召回
+        statusConsumer.accept("📐 正在进行向量检索...");
         TimedValue<List<EmbeddingMatch<TextSegment>>> vectorStep = timeValue("vector_retrieval", () -> searchVectorMatchesWithFallback(request, userIdKey, constraints));
         List<EmbeddingMatch<TextSegment>> vectorMatches = vectorStep.value();
         steps.add(new TraceStep(
@@ -788,6 +800,7 @@ public class DocumentLoader {
                 )
         ));
         //关键字召回
+        statusConsumer.accept("🔎 正在进行关键词检索...");
         TimedValue<List<KeywordHit>> keywordStep = timeValue("keyword_retrieval", () -> searchKeywordHits(normalizedUserId, retrievalQuery, keywordMaxResults));
         List<KeywordHit> keywordHits = keywordStep.value();
         steps.add(new TraceStep(
@@ -802,10 +815,12 @@ public class DocumentLoader {
         ));
 
         List<EmbeddingMatch<TextSegment>> initialVectorMatches = vectorMatches;
+        statusConsumer.accept("⚖️ 正在重排序候选片段...");
         TimedValue<HybridContextResult> hybridStep = timeValue("rerank_and_token_funnel", () -> collectHybridParentContexts(initialVectorMatches, keywordHits, retrievalQuery, constraints, parentContextLimit, scoreCliffMinContexts));
         HybridContextResult hybridResult = hybridStep.value();
         steps.add(new TraceStep("rerank_and_token_funnel", hybridStep.elapsedMillis(), null, hybridResult.traceData()));
         if (hybridResult.contexts().isEmpty()) {
+            statusConsumer.accept("🔁 正在放宽条件重新检索...");
             EmbeddingSearchRequest relaxedRequest = buildResumeSearchRequest(queryEmbedding, buildBaseResumeFilter(normalizedUserId), vectorMaxResults, 0.7);
             TimedValue<List<EmbeddingMatch<TextSegment>>> relaxedVectorStep = timeValue("vector_retrieval_relaxed", () -> searchVectorMatchesWithFallback(relaxedRequest, userIdKey, ResumeFilterConstraints.empty()));
             vectorMatches = relaxedVectorStep.value();
