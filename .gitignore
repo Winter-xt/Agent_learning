@@ -33,3 +33,4 @@ build/
 .vscode/
 
 repomix-output.xml
+.DS_Store
