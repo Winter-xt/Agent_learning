@@ -27,6 +27,7 @@ import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.filter.Filter;
 import dev.langchain4j.store.embedding.filter.logical.And;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StopWatch;
@@ -53,6 +54,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.zip.ZipEntry;
@@ -105,6 +108,7 @@ public class DocumentLoader {
     private final ResumeParentBlockMapper resumeParentBlockMapper;
     private final ResumeDocumentMapper resumeDocumentMapper;
     private final ResumeQueryTraceService resumeQueryTraceService;
+    private final Executor aiTaskExecutor;
     private final ApacheTikaDocumentParser parser;
     private final String vectorIndexName;
     private final Path resumeStorageDir;
@@ -122,6 +126,7 @@ public class DocumentLoader {
                           ResumeParentBlockMapper resumeParentBlockMapper,
                           ResumeDocumentMapper resumeDocumentMapper,
                           ResumeQueryTraceService resumeQueryTraceService,
+                          @Qualifier("aiTaskExecutor") Executor aiTaskExecutor,
                           @org.springframework.beans.factory.annotation.Value("${app.recall.vector-weight:1.0}") double vectorRecallWeight,
                           @org.springframework.beans.factory.annotation.Value("${app.recall.keyword-weight:1.0}") double keywordRecallWeight,
                           @org.springframework.beans.factory.annotation.Value("${app.vector.index-name:talent-index-v4}") String vectorIndexName,
@@ -134,6 +139,7 @@ public class DocumentLoader {
         this.resumeParentBlockMapper = resumeParentBlockMapper;
         this.resumeDocumentMapper = resumeDocumentMapper;
         this.resumeQueryTraceService = resumeQueryTraceService;
+        this.aiTaskExecutor = aiTaskExecutor;
         this.parser = new ApacheTikaDocumentParser();
         this.vectorRecallWeight = vectorRecallWeight;
         this.keywordRecallWeight = keywordRecallWeight;
@@ -520,28 +526,11 @@ public class DocumentLoader {
         String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
         List<TraceStep> steps = new ArrayList<>();
 
-        //意图识别，判断用户的问题是否需要 RAG
-        TimedValue<Intent> intentStep = timeValue("intent_classification", () -> classifyIntent(query));
-        Intent intent = intentStep.value();
-        steps.add(new TraceStep(
-                "intent_classification",
-                intentStep.elapsedMillis(),
-                null,
-                Map.of("intent", intent.name())
-        ));
+        QueryPreprocessing preprocessing = preprocessResumeQuery(query, steps);
+        Intent intent = preprocessing.intent();
         if (shouldUseResumeRag(intent)) {
-            TimedValue<String> rewriteStep = timeValue("query_rewrite", () -> rewriteResumeQuery(query));
-            String rewrittenQuery = rewriteStep.value();
-            steps.add(new TraceStep(
-                    "query_rewrite",
-                    rewriteStep.elapsedMillis(),
-                    null,
-                    Map.of(
-                            "before", ResumeTextUtils.safe(query),
-                            "after", rewrittenQuery
-                    )
-            ));
-            QueryResumeExecution execution = queryResumeWithRag(normalizedUserId, query, rewrittenQuery, isHorizontalCompareIntent(intent), steps);
+            String rewrittenQuery = preprocessing.rewrittenQuery();
+            QueryResumeExecution execution = queryResumeWithRag(normalizedUserId, query, rewrittenQuery, preprocessing.constraints(), isHorizontalCompareIntent(intent), steps);
             ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, rewrittenQuery, intent.name(), execution.totalElapsedMillis(), steps);
             resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, rewrittenQuery, intent.name(), execution.answer(), trace);
             return new QueryResumeResult(execution.answer(), trace);
@@ -564,8 +553,8 @@ public class DocumentLoader {
                 estimateTokenCount(prompt, answerStep.value()),
                 Map.of("reason", "intent_not_resume_rag")
         ));
-        ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, ResumeTextUtils.safe(query), intent.name(), sumElapsedMillis(steps), steps);
-        resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, query, intent.name(), answerStep.value(), trace);
+        ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, preprocessing.rewrittenQuery(), intent.name(), sumElapsedMillis(steps), steps);
+        resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, preprocessing.rewrittenQuery(), intent.name(), answerStep.value(), trace);
         return new QueryResumeResult(answerStep.value(), trace);
     }
 
@@ -584,32 +573,14 @@ public class DocumentLoader {
         List<TraceStep> steps = new ArrayList<>();
 
         try {
-            statusConsumer.accept("🧭 正在识别查询意图...");
-            TimedValue<Intent> intentStep = timeValue("intent_classification", () -> classifyIntent(query));
-            Intent intent = intentStep.value();
-            steps.add(new TraceStep(
-                    "intent_classification",
-                    intentStep.elapsedMillis(),
-                    null,
-                    Map.of("intent", intent.name())
-            ));
+            statusConsumer.accept("🧭 正在并行识别意图、重写查询和提取筛选条件...");
+            QueryPreprocessing preprocessing = preprocessResumeQuery(query, steps);
+            Intent intent = preprocessing.intent();
 
-            String rewrittenQuery = ResumeTextUtils.safe(query);
+            String rewrittenQuery = preprocessing.rewrittenQuery();
             ResumeAnswerPreparation preparation;
             if (shouldUseResumeRag(intent)) {
-                statusConsumer.accept("🔍 正在重写查询...");
-                TimedValue<String> rewriteStep = timeValue("query_rewrite", () -> rewriteResumeQuery(query));
-                rewrittenQuery = rewriteStep.value();
-                steps.add(new TraceStep(
-                        "query_rewrite",
-                        rewriteStep.elapsedMillis(),
-                        null,
-                        Map.of(
-                                "before", ResumeTextUtils.safe(query),
-                                "after", rewrittenQuery
-                        )
-                ));
-                preparation = prepareResumeRagAnswer(normalizedUserId, query, rewrittenQuery, isHorizontalCompareIntent(intent), steps, statusConsumer);
+                preparation = prepareResumeRagAnswer(normalizedUserId, query, rewrittenQuery, preprocessing.constraints(), isHorizontalCompareIntent(intent), steps, statusConsumer);
             } else {
                 statusConsumer.accept("💬 正在组织回复...");
                 String prompt = """
@@ -742,16 +713,166 @@ public class DocumentLoader {
     private QueryResumeExecution queryResumeWithRag(String normalizedUserId,
                                                     String originalQuery,
                                                     String retrievalQuery,
+                                                    ResumeFilterConstraints constraints,
                                                     boolean horizontalCompare,
                                                     List<TraceStep> steps) {
-        ResumeAnswerPreparation preparation = prepareResumeRagAnswer(normalizedUserId, originalQuery, retrievalQuery, horizontalCompare, steps, status -> {
+        ResumeAnswerPreparation preparation = prepareResumeRagAnswer(normalizedUserId, originalQuery, retrievalQuery, constraints, horizontalCompare, steps, status -> {
         });
         return completeResumeAnswer(preparation, steps);
+    }
+
+    private QueryPreprocessing preprocessResumeQuery(String query, List<TraceStep> steps) {
+        CompletableFuture<AsyncTimedValue<Intent>> intentFuture = asyncTimeValue(
+                "intent_classification",
+                () -> classifyIntent(query),
+                Intent.UNKNOWN
+        );
+        CompletableFuture<AsyncTimedValue<String>> rewriteFuture = asyncTimeValue(
+                "query_rewrite",
+                () -> rewriteResumeQueryStrict(query),
+                ResumeTextUtils.safe(query)
+        );
+        CompletableFuture<AsyncTimedValue<ResumeFilterConstraints>> constraintsFuture = asyncTimeValue(
+                "metadata_constraints",
+                () -> extractResumeFilterConstraintsStrict(query),
+                ResumeFilterConstraints.empty()
+        );
+
+        CompletableFuture.allOf(intentFuture, rewriteFuture, constraintsFuture).join();
+
+        AsyncTimedValue<Intent> intentStep = intentFuture.join();
+        AsyncTimedValue<String> rewriteStep = rewriteFuture.join();
+        AsyncTimedValue<ResumeFilterConstraints> constraintsStep = constraintsFuture.join();
+
+        Intent intent = intentStep.value() == null ? Intent.UNKNOWN : intentStep.value();
+        String rewrittenQuery = normalizeRewrittenQuery(rewriteStep.value());
+        if (rewrittenQuery.isBlank()) {
+            rewrittenQuery = ResumeTextUtils.safe(query);
+        }
+        ResumeFilterConstraints constraints = constraintsStep.value() == null ? ResumeFilterConstraints.empty() : constraintsStep.value();
+
+        Map<String, Object> intentData = traceData(
+                "intent", intent.name(),
+                "async", true
+        );
+        addFailureTraceData(intentData, intentStep);
+        steps.add(new TraceStep("intent_classification", intentStep.elapsedMillis(), null, intentData));
+
+        Map<String, Object> rewriteData = traceData(
+                "before", ResumeTextUtils.safe(query),
+                "after", rewrittenQuery,
+                "async", true,
+                "fallbackUsed", !rewriteStep.success()
+        );
+        addFailureTraceData(rewriteData, rewriteStep);
+        steps.add(new TraceStep("query_rewrite", rewriteStep.elapsedMillis(), null, rewriteData));
+
+        Map<String, Object> constraintsData = traceData(
+                "constraints", constraints,
+                "async", true,
+                "fallbackUsed", !constraintsStep.success()
+        );
+        addFailureTraceData(constraintsData, constraintsStep);
+        steps.add(new TraceStep("metadata_constraints", constraintsStep.elapsedMillis(), null, constraintsData));
+
+        return new QueryPreprocessing(intent, rewrittenQuery, constraints);
+    }
+
+    private RetrievalResults retrieveResumeMatchesInParallel(String normalizedUserId,
+                                                             String userIdKey,
+                                                             String retrievalQuery,
+                                                             ResumeFilterConstraints constraints,
+                                                             int vectorMaxResults,
+                                                             int keywordMaxResults) {
+        CompletableFuture<VectorRetrievalResult> vectorFuture = CompletableFuture.supplyAsync(
+                () -> retrieveVectorMatches(normalizedUserId, userIdKey, retrievalQuery, constraints, vectorMaxResults),
+                aiTaskExecutor
+        );
+        CompletableFuture<KeywordRetrievalResult> keywordFuture = CompletableFuture.supplyAsync(
+                () -> retrieveKeywordHits(normalizedUserId, retrievalQuery, keywordMaxResults),
+                aiTaskExecutor
+        );
+
+        VectorRetrievalResult vectorResult = vectorFuture.join();
+        KeywordRetrievalResult keywordResult = keywordFuture.join();
+        List<TraceStep> retrievalSteps = new ArrayList<>();
+        retrievalSteps.addAll(vectorResult.steps());
+        retrievalSteps.addAll(keywordResult.steps());
+        return new RetrievalResults(vectorResult.queryEmbedding(), vectorResult.vectorMatches(), keywordResult.keywordHits(), retrievalSteps);
+    }
+
+    private VectorRetrievalResult retrieveVectorMatches(String normalizedUserId,
+                                                        String userIdKey,
+                                                        String retrievalQuery,
+                                                        ResumeFilterConstraints constraints,
+                                                        int vectorMaxResults) {
+        List<TraceStep> steps = new ArrayList<>();
+        AsyncTimedValue<Response<Embedding>> embeddingStep = safeTimeValue("query_embedding", () -> embeddingModel.embed(retrievalQuery), null);
+        Response<Embedding> queryEmbeddingResponse = embeddingStep.value();
+        Embedding queryEmbedding = queryEmbeddingResponse == null ? null : queryEmbeddingResponse.content();
+        Map<String, Object> embeddingData = traceData(
+                "text", retrievalQuery,
+                "async", true,
+                "fallbackUsed", !embeddingStep.success()
+        );
+        addFailureTraceData(embeddingData, embeddingStep);
+        steps.add(new TraceStep(
+                "query_embedding",
+                embeddingStep.elapsedMillis(),
+                queryEmbeddingResponse == null || queryEmbeddingResponse.tokenUsage() == null ? null : queryEmbeddingResponse.tokenUsage().totalTokenCount(),
+                embeddingData
+        ));
+        if (queryEmbedding == null) {
+            steps.add(new TraceStep(
+                    "vector_retrieval",
+                    0L,
+                    null,
+                    traceData("topN", vectorMaxResults, "returned", 0, "matches", List.of(), "skipped", "query_embedding_failed")
+            ));
+            return new VectorRetrievalResult(queryEmbedding, List.of(), steps);
+        }
+
+        EmbeddingSearchRequest request = buildResumeSearchRequest(queryEmbedding, buildDynamicResumeFilter(normalizedUserId, constraints), vectorMaxResults, 0.7);
+        AsyncTimedValue<List<EmbeddingMatch<TextSegment>>> vectorStep = safeTimeValue(
+                "vector_retrieval",
+                () -> searchVectorMatchesWithFallback(request, userIdKey, constraints),
+                List.of()
+        );
+        List<EmbeddingMatch<TextSegment>> vectorMatches = vectorStep.value() == null ? List.of() : vectorStep.value();
+        Map<String, Object> vectorData = traceData(
+                "topN", vectorMaxResults,
+                "returned", vectorMatches.size(),
+                "matches", toVectorTraceItems(vectorMatches),
+                "async", true,
+                "fallbackUsed", !vectorStep.success()
+        );
+        addFailureTraceData(vectorData, vectorStep);
+        steps.add(new TraceStep("vector_retrieval", vectorStep.elapsedMillis(), null, vectorData));
+        return new VectorRetrievalResult(queryEmbedding, vectorMatches, steps);
+    }
+
+    private KeywordRetrievalResult retrieveKeywordHits(String normalizedUserId, String retrievalQuery, int keywordMaxResults) {
+        AsyncTimedValue<List<KeywordHit>> keywordStep = safeTimeValue(
+                "keyword_retrieval",
+                () -> searchKeywordHits(normalizedUserId, retrievalQuery, keywordMaxResults),
+                List.of()
+        );
+        List<KeywordHit> keywordHits = keywordStep.value() == null ? List.of() : keywordStep.value();
+        Map<String, Object> keywordData = traceData(
+                "topN", keywordMaxResults,
+                "returned", keywordHits.size(),
+                "hits", keywordHits,
+                "async", true,
+                "fallbackUsed", !keywordStep.success()
+        );
+        addFailureTraceData(keywordData, keywordStep);
+        return new KeywordRetrievalResult(keywordHits, List.of(new TraceStep("keyword_retrieval", keywordStep.elapsedMillis(), null, keywordData)));
     }
 
     private ResumeAnswerPreparation prepareResumeRagAnswer(String normalizedUserId,
                                                            String originalQuery,
                                                            String retrievalQuery,
+                                                           ResumeFilterConstraints constraints,
                                                            boolean horizontalCompare,
                                                            List<TraceStep> steps,
                                                            Consumer<String> statusConsumer) {
@@ -762,57 +883,14 @@ public class DocumentLoader {
         int parentContextLimit = horizontalCompare ? HORIZONTAL_COMPARE_PARENT_CONTEXTS : RESUME_PARENT_CONTEXTS;
         int scoreCliffMinContexts = horizontalCompare ? HORIZONTAL_COMPARE_SCORE_CLIFF_MIN_CONTEXTS : SCORE_CLIFF_MIN_CONTEXTS;
 
-        //提取约束条件
-        statusConsumer.accept("🧩 正在提取筛选条件...");
-        TimedValue<ResumeFilterConstraints> constraintsStep = timeValue("metadata_constraints", () -> extractResumeFilterConstraints(retrievalQuery));
-        ResumeFilterConstraints constraints = constraintsStep.value();
-        steps.add(new TraceStep(
-                "metadata_constraints",
-                constraintsStep.elapsedMillis(),
-                null,
-                Map.of("constraints", constraints)
-        ));
         String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
-        TimedValue<Response<Embedding>> embeddingStep = timeValue("query_embedding", () -> embeddingModel.embed(retrievalQuery));
-        Response<Embedding> queryEmbeddingResponse = embeddingStep.value();
-        Embedding queryEmbedding = queryEmbeddingResponse.content();
-        steps.add(new TraceStep(
-                "query_embedding",
-                embeddingStep.elapsedMillis(),
-                queryEmbeddingResponse.tokenUsage() == null ? null : queryEmbeddingResponse.tokenUsage().totalTokenCount(),
-                Map.of("text", retrievalQuery)
-        ));
 
         statusConsumer.accept("📚 正在调用知识库...");
-        EmbeddingSearchRequest request = buildResumeSearchRequest(queryEmbedding, buildDynamicResumeFilter(normalizedUserId, constraints), vectorMaxResults, 0.7);
-        //向量召回
-        statusConsumer.accept("📐 正在进行向量检索...");
-        TimedValue<List<EmbeddingMatch<TextSegment>>> vectorStep = timeValue("vector_retrieval", () -> searchVectorMatchesWithFallback(request, userIdKey, constraints));
-        List<EmbeddingMatch<TextSegment>> vectorMatches = vectorStep.value();
-        steps.add(new TraceStep(
-                "vector_retrieval",
-                vectorStep.elapsedMillis(),
-                null,
-                Map.of(
-                        "topN", vectorMaxResults,
-                        "returned", vectorMatches.size(),
-                        "matches", toVectorTraceItems(vectorMatches)
-                )
-        ));
-        //关键字召回
-        statusConsumer.accept("🔎 正在进行关键词检索...");
-        TimedValue<List<KeywordHit>> keywordStep = timeValue("keyword_retrieval", () -> searchKeywordHits(normalizedUserId, retrievalQuery, keywordMaxResults));
-        List<KeywordHit> keywordHits = keywordStep.value();
-        steps.add(new TraceStep(
-                "keyword_retrieval",
-                keywordStep.elapsedMillis(),
-                null,
-                Map.of(
-                        "topN", keywordMaxResults,
-                        "returned", keywordHits.size(),
-                        "hits", keywordHits
-                )
-        ));
+        statusConsumer.accept("📐 正在并行进行向量检索和关键词检索...");
+        RetrievalResults retrievalResults = retrieveResumeMatchesInParallel(normalizedUserId, userIdKey, retrievalQuery, constraints, vectorMaxResults, keywordMaxResults);
+        steps.addAll(retrievalResults.steps());
+        List<EmbeddingMatch<TextSegment>> vectorMatches = retrievalResults.vectorMatches();
+        List<KeywordHit> keywordHits = retrievalResults.keywordHits();
 
         List<EmbeddingMatch<TextSegment>> initialVectorMatches = vectorMatches;
         statusConsumer.accept("⚖️ 正在重排序候选片段...");
@@ -821,6 +899,12 @@ public class DocumentLoader {
         steps.add(new TraceStep("rerank_and_token_funnel", hybridStep.elapsedMillis(), null, hybridResult.traceData()));
         if (hybridResult.contexts().isEmpty()) {
             statusConsumer.accept("🔁 正在放宽条件重新检索...");
+            Embedding queryEmbedding = retrievalResults.queryEmbedding();
+            if (queryEmbedding == null) {
+                String answer = "向量检索暂时不可用，未能完成简历片段召回。请稍后重试。";
+                ragStopWatch.stop();
+                return new ResumeAnswerPreparation("", answer, ragStopWatch.getTotalTimeMillis(), 0);
+            }
             EmbeddingSearchRequest relaxedRequest = buildResumeSearchRequest(queryEmbedding, buildBaseResumeFilter(normalizedUserId), vectorMaxResults, 0.7);
             TimedValue<List<EmbeddingMatch<TextSegment>>> relaxedVectorStep = timeValue("vector_retrieval_relaxed", () -> searchVectorMatchesWithFallback(relaxedRequest, userIdKey, ResumeFilterConstraints.empty()));
             vectorMatches = relaxedVectorStep.value();
@@ -1013,11 +1097,15 @@ public class DocumentLoader {
      */
     private String rewriteResumeQuery(String query) {
         try {
-            String rewritten = normalizeRewrittenQuery(metadataFilterAiService.rewriteResumeQuery(query));
+            String rewritten = rewriteResumeQueryStrict(query);
             return rewritten.isBlank() ? ResumeTextUtils.safe(query) : rewritten;
         } catch (Exception ignored) {
             return ResumeTextUtils.safe(query);
         }
+    }
+
+    private String rewriteResumeQueryStrict(String query) {
+        return normalizeRewrittenQuery(metadataFilterAiService.rewriteResumeQuery(query));
     }
 
     private String normalizeRewrittenQuery(String raw) {
@@ -1043,6 +1131,14 @@ public class DocumentLoader {
      */
     private ResumeFilterConstraints extractResumeFilterConstraints(String query) {
         try {
+            return extractResumeFilterConstraintsStrict(query);
+        } catch (Exception ignored) {
+            return ResumeFilterConstraints.empty();
+        }
+    }
+
+    private ResumeFilterConstraints extractResumeFilterConstraintsStrict(String query) {
+        try {
             String json = metadataFilterAiService.extract(query);
             JsonNode node = objectMapper.readTree(json);
             String parentType = normalizeParentType(node.path("parentType").asText(""));
@@ -1060,8 +1156,8 @@ public class DocumentLoader {
                     readKeywordArray(node, "industries"),
                     readKeywordArray(node, "keywords")
             );
-        } catch (Exception ignored) {
-            return ResumeFilterConstraints.empty();
+        } catch (Exception e) {
+            throw new IllegalStateException("提取简历检索约束失败", e);
         }
     }
 
@@ -1260,7 +1356,7 @@ public class DocumentLoader {
         return embeddingStore.search(fallbackRequest).matches().stream()
                 .filter(match -> match.embedded() != null && match.embedded().metadata() != null)
                 .filter(match -> metadataMatchesResumeFilter(match.embedded().metadata(), userIdKey, constraints))
-                .limit(12)
+                .limit(request.maxResults())
                 .toList();
     }
 
@@ -1962,6 +2058,23 @@ public class DocumentLoader {
         return PARENT_BLOCK_CACHE_KEY_PREFIX + parentBlockId;
     }
 
+    private <T> CompletableFuture<AsyncTimedValue<T>> asyncTimeValue(String taskName, Supplier<T> supplier, T fallbackValue) {
+        return CompletableFuture.supplyAsync(() -> safeTimeValue(taskName, supplier, fallbackValue), aiTaskExecutor);
+    }
+
+    private <T> AsyncTimedValue<T> safeTimeValue(String taskName, Supplier<T> supplier, T fallbackValue) {
+        StopWatch stopWatch = new StopWatch();
+        stopWatch.start(taskName);
+        try {
+            T value = supplier.get();
+            stopWatch.stop();
+            return new AsyncTimedValue<>(value, stopWatch.getTotalTimeMillis(), true, "");
+        } catch (Exception e) {
+            stopWatch.stop();
+            return new AsyncTimedValue<>(fallbackValue, stopWatch.getTotalTimeMillis(), false, formatError(e));
+        }
+    }
+
     private <T> TimedValue<T> timeValue(String taskName, Supplier<T> supplier) {
         StopWatch stopWatch = new StopWatch();
         stopWatch.start(taskName);
@@ -1972,6 +2085,29 @@ public class DocumentLoader {
             stopWatch.stop();
         }
         return new TimedValue<>(value, stopWatch.getTotalTimeMillis());
+    }
+
+    private Map<String, Object> traceData(Object... keyValues) {
+        Map<String, Object> data = new LinkedHashMap<>();
+        for (int i = 0; i + 1 < keyValues.length; i += 2) {
+            data.put(String.valueOf(keyValues[i]), keyValues[i + 1]);
+        }
+        return data;
+    }
+
+    private void addFailureTraceData(Map<String, Object> data, AsyncTimedValue<?> step) {
+        if (data == null || step == null || step.success()) {
+            return;
+        }
+        data.put("error", step.error());
+    }
+
+    private String formatError(Exception e) {
+        if (e == null) {
+            return "";
+        }
+        String message = ResumeTextUtils.safe(e.getMessage());
+        return message.isBlank() ? e.getClass().getSimpleName() : e.getClass().getSimpleName() + ": " + message;
     }
 
     private long sumElapsedMillis(List<TraceStep> steps) {
@@ -2000,6 +2136,42 @@ public class DocumentLoader {
     private record TimedValue<T>(
             T value,
             long elapsedMillis
+    ) {
+    }
+
+    private record AsyncTimedValue<T>(
+            T value,
+            long elapsedMillis,
+            boolean success,
+            String error
+    ) {
+    }
+
+    private record QueryPreprocessing(
+            Intent intent,
+            String rewrittenQuery,
+            ResumeFilterConstraints constraints
+    ) {
+    }
+
+    private record RetrievalResults(
+            Embedding queryEmbedding,
+            List<EmbeddingMatch<TextSegment>> vectorMatches,
+            List<KeywordHit> keywordHits,
+            List<TraceStep> steps
+    ) {
+    }
+
+    private record VectorRetrievalResult(
+            Embedding queryEmbedding,
+            List<EmbeddingMatch<TextSegment>> vectorMatches,
+            List<TraceStep> steps
+    ) {
+    }
+
+    private record KeywordRetrievalResult(
+            List<KeywordHit> keywordHits,
+            List<TraceStep> steps
     ) {
     }
 
