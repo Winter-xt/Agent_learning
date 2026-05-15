@@ -12,30 +12,29 @@ import dev.langchain4j.service.UserMessage;
 public interface ResumeMetadataFilterAiService {
 
     @SystemMessage("""
-            你是一个“简历检索查询重写器”。
-            请将用户在简历问答场景中的问题改写为更适合 RAG 检索的查询。
+            你是一个“简历查询预处理器”。
+            请对用户问题一次性完成：意图识别、RAG 检索查询重写、metadata 约束提取，并严格按 JSON 输出。
 
-            改写目标：
+            仅允许输出以下顶层字段：
+            - intent: 仅可为 "RESUME_QUERY"、"HORIZONTAL_COMPARE"、"GENERAL_QA"、"CHITCHAT"、"UNKNOWN"
+            - rewrittenQuery: 改写后的检索查询；无法或不需要改写时输出原问题
+            - constraints: metadata 过滤条件对象
+
+            intent 分类规则：
+            - RESUME_QUERY：与简历检索、候选人信息、项目经历、技能、教育背景、工作经历相关。
+            - HORIZONTAL_COMPARE：要求对多个候选人、简历、项目、技能、教育背景、工作经历等做横向比较、优劣判断、差异分析或排序选择。
+            - GENERAL_QA：客观信息问答、知识问答、说明解释类问题。
+            - CHITCHAT：寒暄、闲聊、情绪表达、无明确任务的对话。
+            - UNKNOWN：无法判断，或语义不完整。
+
+            rewrittenQuery 改写要求：
             1) 保留用户原始意图，不要改变筛选条件、候选人范围或问题类型。
             2) 将口语、省略、代词和泛化表达补全为清晰的简历检索描述。
             3) 优先补充与简历召回相关的关键词，例如技能、项目、工作经历、教育背景、公司、岗位、行业、证书、候选人姓名。
             4) 对“名校”“大厂”等泛化条件保持原词，不要展开成具体学校或公司列表。
             5) 不要编造用户没有表达的技术栈、公司、学校、姓名或经历。
 
-            输出要求：
-            只输出改写后的一个查询句，不要输出 Markdown，不要解释。
-
-            示例：
-            用户问题：有没有大厂 Java 候选人？
-            输出：检索具有大厂工作或实习背景，并具备 Java 技术经验的候选人简历。
-            """)
-    String rewriteResumeQuery(@UserMessage String query);
-
-    @SystemMessage("""
-            你是一个“简历检索条件提取器”。
-            请从用户问题中提取可用于 metadata 过滤的条件，并严格按 JSON 输出。
-
-            仅允许输出以下字段：
+            constraints 仅允许包含以下字段：
             - parentType: 仅可为 "project" 或 "resume"
             - fileName: 文件名（可为空）
             - contentType: MIME 类型（可为空）
@@ -47,20 +46,21 @@ public interface ResumeMetadataFilterAiService {
             - industries: 行业/业务领域关键词数组（可为空数组）
             - keywords: 其他适合做简历 metadata 过滤的关键词数组（可为空数组）
 
+            constraints 提取要求：
+            1) 未提及的字符串字段输出空字符串，未提及的数组字段输出空数组。
+            2) 数组字段只放用户问题中明确出现、或可由问题直接等价归一化出的短关键词。
+            3) 用户提到“名校、985、211、双一流、C9、重点大学”等教育背景要求时，在 schools 中输出 "名校"。
+            4) 用户提到“大厂、一线互联网、头部互联网、知名互联网、BAT、TMD、FAANG”等公司背景要求时，在 companies 中输出 "大厂"。
+            5) 不要把“大厂”展开成多个公司名；不要把“名校”展开成多个学校名。
+
             输出要求：
             1) 只输出一个 JSON 对象，不要输出 Markdown，不要解释。
-            2) 未提及的字符串字段输出空字符串，未提及的数组字段输出空数组。
-            3) 不能臆造字段，不能输出额外 key。
-            4) 数组字段只放用户问题中明确出现、或可由问题直接等价归一化出的短关键词。
-            5) 需要理解“名校”和“大厂”等泛化条件：
-               - 用户提到“名校、985、211、双一流、C9、重点大学”等教育背景要求时，在 schools 中输出 "名校"。
-               - 用户提到“大厂、一线互联网、头部互联网、知名互联网、BAT、TMD、FAANG”等公司背景要求时，在 companies 中输出 "大厂"。
-               - 不要把“大厂”展开成多个公司名；不要把“名校”展开成多个学校名。
+            2) 不要输出额外 key。
 
             示例输出：
-            {"parentType":"project","fileName":"","contentType":"","skills":["Java","Spring"],"companies":["大厂"],"schools":["名校"],"titles":[],"projects":[],"industries":[],"keywords":[]}
+            {"intent":"HORIZONTAL_COMPARE","rewrittenQuery":"横向对比具有大厂背景和 Java 技术经验的候选人简历。","constraints":{"parentType":"","fileName":"","contentType":"","skills":["Java"],"companies":["大厂"],"schools":[],"titles":[],"projects":[],"industries":[],"keywords":[]}}
             """)
-    String extract(@UserMessage String query);
+    String preprocessResumeQuery(@UserMessage String query);
 
     @SystemMessage("""
             你是一个“简历文件识别和主信息提取器”。

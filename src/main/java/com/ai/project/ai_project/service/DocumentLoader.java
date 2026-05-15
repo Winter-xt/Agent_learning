@@ -114,7 +114,6 @@ public class DocumentLoader {
     private final Path resumeStorageDir;
     private final double vectorRecallWeight;
     private final double keywordRecallWeight;
-    private final AiService intentClassifier;
     private final ResumeMetadataFilterAiService metadataFilterAiService;
     private final ObjectMapper objectMapper;
 
@@ -145,9 +144,6 @@ public class DocumentLoader {
         this.keywordRecallWeight = keywordRecallWeight;
         this.vectorIndexName = vectorIndexName;
         this.resumeStorageDir = Path.of(resumeStorageDir);
-        this.intentClassifier = AiServices.builder(AiService.class)
-                .chatModel(chatLanguageModel)
-                .build();
         this.metadataFilterAiService = AiServices.builder(ResumeMetadataFilterAiService.class)
                 .chatModel(chatLanguageModel)
                 .build();
@@ -573,7 +569,7 @@ public class DocumentLoader {
         List<TraceStep> steps = new ArrayList<>();
 
         try {
-            statusConsumer.accept("🧭 正在并行识别意图、重写查询和提取筛选条件...");
+            statusConsumer.accept("🧭 正在预处理查询...");
             QueryPreprocessing preprocessing = preprocessResumeQuery(query, steps);
             Intent intent = preprocessing.intent();
 
@@ -722,60 +718,34 @@ public class DocumentLoader {
     }
 
     private QueryPreprocessing preprocessResumeQuery(String query, List<TraceStep> steps) {
-        CompletableFuture<AsyncTimedValue<Intent>> intentFuture = asyncTimeValue(
-                "intent_classification",
-                () -> classifyIntent(query),
-                Intent.UNKNOWN
+        QueryPreprocessing fallback = new QueryPreprocessing(Intent.UNKNOWN, ResumeTextUtils.safe(query), ResumeFilterConstraints.empty());
+        AsyncTimedValue<QueryPreprocessing> preprocessingStep = safeTimeValue(
+                "query_preprocessing",
+                () -> preprocessResumeQueryStrict(query),
+                fallback
         );
-        CompletableFuture<AsyncTimedValue<String>> rewriteFuture = asyncTimeValue(
-                "query_rewrite",
-                () -> rewriteResumeQueryStrict(query),
-                ResumeTextUtils.safe(query)
-        );
-        CompletableFuture<AsyncTimedValue<ResumeFilterConstraints>> constraintsFuture = asyncTimeValue(
-                "metadata_constraints",
-                () -> extractResumeFilterConstraintsStrict(query),
-                ResumeFilterConstraints.empty()
-        );
-
-        CompletableFuture.allOf(intentFuture, rewriteFuture, constraintsFuture).join();
-
-        AsyncTimedValue<Intent> intentStep = intentFuture.join();
-        AsyncTimedValue<String> rewriteStep = rewriteFuture.join();
-        AsyncTimedValue<ResumeFilterConstraints> constraintsStep = constraintsFuture.join();
-
-        Intent intent = intentStep.value() == null ? Intent.UNKNOWN : intentStep.value();
-        String rewrittenQuery = normalizeRewrittenQuery(rewriteStep.value());
+        QueryPreprocessing preprocessing = preprocessingStep.value() == null ? fallback : preprocessingStep.value();
+        String rewrittenQuery = normalizeRewrittenQuery(preprocessing.rewrittenQuery());
         if (rewrittenQuery.isBlank()) {
             rewrittenQuery = ResumeTextUtils.safe(query);
         }
-        ResumeFilterConstraints constraints = constraintsStep.value() == null ? ResumeFilterConstraints.empty() : constraintsStep.value();
-
-        Map<String, Object> intentData = traceData(
-                "intent", intent.name(),
-                "async", true
+        preprocessing = new QueryPreprocessing(
+                preprocessing.intent() == null ? Intent.UNKNOWN : preprocessing.intent(),
+                rewrittenQuery,
+                preprocessing.constraints() == null ? ResumeFilterConstraints.empty() : preprocessing.constraints()
         );
-        addFailureTraceData(intentData, intentStep);
-        steps.add(new TraceStep("intent_classification", intentStep.elapsedMillis(), null, intentData));
 
-        Map<String, Object> rewriteData = traceData(
+        Map<String, Object> preprocessingData = traceData(
+                "intent", preprocessing.intent().name(),
                 "before", ResumeTextUtils.safe(query),
-                "after", rewrittenQuery,
-                "async", true,
-                "fallbackUsed", !rewriteStep.success()
+                "after", preprocessing.rewrittenQuery(),
+                "constraints", preprocessing.constraints(),
+                "fallbackUsed", !preprocessingStep.success()
         );
-        addFailureTraceData(rewriteData, rewriteStep);
-        steps.add(new TraceStep("query_rewrite", rewriteStep.elapsedMillis(), null, rewriteData));
+        addFailureTraceData(preprocessingData, preprocessingStep);
+        steps.add(new TraceStep("query_preprocessing", preprocessingStep.elapsedMillis(), null, preprocessingData));
 
-        Map<String, Object> constraintsData = traceData(
-                "constraints", constraints,
-                "async", true,
-                "fallbackUsed", !constraintsStep.success()
-        );
-        addFailureTraceData(constraintsData, constraintsStep);
-        steps.add(new TraceStep("metadata_constraints", constraintsStep.elapsedMillis(), null, constraintsData));
-
-        return new QueryPreprocessing(intent, rewrittenQuery, constraints);
+        return preprocessing;
     }
 
     private RetrievalResults retrieveResumeMatchesInParallel(String normalizedUserId,
@@ -966,6 +936,22 @@ public class DocumentLoader {
         return new ResumeAnswerPreparation(prompt, "", ragStopWatch.getTotalTimeMillis(), hybridResult.contexts().size());
     }
 
+    private QueryPreprocessing preprocessResumeQueryStrict(String query) {
+        try {
+            String json = normalizeJsonObject(metadataFilterAiService.preprocessResumeQuery(query));
+            JsonNode node = objectMapper.readTree(json);
+            Intent intent = IntentRoutingUtils.parseIntentLabel(node.path("intent").asText(""));
+            String rewrittenQuery = normalizeRewrittenQuery(node.path("rewrittenQuery").asText(query));
+            if (rewrittenQuery.isBlank()) {
+                rewrittenQuery = ResumeTextUtils.safe(query);
+            }
+            ResumeFilterConstraints constraints = readResumeFilterConstraints(node.path("constraints"));
+            return new QueryPreprocessing(intent, rewrittenQuery, constraints);
+        } catch (Exception e) {
+            throw new IllegalStateException("简历查询预处理失败", e);
+        }
+    }
+
     private QueryResumeExecution completeResumeAnswer(ResumeAnswerPreparation preparation, List<TraceStep> steps) {
         if (!preparation.immediateAnswer().isBlank()) {
             return new QueryResumeExecution(preparation.immediateAnswer(), preparation.preparationElapsedMillis() + sumElapsedMillis(steps));
@@ -1092,22 +1078,6 @@ public class DocumentLoader {
         return merged;
     }
 
-    /**
-     * RAG 前对用户查询做检索向改写，失败或结果异常时回退原问题。
-     */
-    private String rewriteResumeQuery(String query) {
-        try {
-            String rewritten = rewriteResumeQueryStrict(query);
-            return rewritten.isBlank() ? ResumeTextUtils.safe(query) : rewritten;
-        } catch (Exception ignored) {
-            return ResumeTextUtils.safe(query);
-        }
-    }
-
-    private String rewriteResumeQueryStrict(String query) {
-        return normalizeRewrittenQuery(metadataFilterAiService.rewriteResumeQuery(query));
-    }
-
     private String normalizeRewrittenQuery(String raw) {
         String value = ResumeTextUtils.safe(raw)
                 .replaceAll("(?i)^```[a-z]*", "")
@@ -1126,39 +1096,39 @@ public class DocumentLoader {
         return value;
     }
 
-    /**
-     * 调用 LLM 提取结构化约束，并做白名单清洗，避免模型输出污染检索条件。
-     */
-    private ResumeFilterConstraints extractResumeFilterConstraints(String query) {
-        try {
-            return extractResumeFilterConstraintsStrict(query);
-        } catch (Exception ignored) {
-            return ResumeFilterConstraints.empty();
+    private String normalizeJsonObject(String raw) {
+        String value = ResumeTextUtils.safe(raw)
+                .replaceAll("(?i)^```json", "")
+                .replaceAll("(?i)^```", "")
+                .replaceAll("```$", "")
+                .trim();
+        int start = value.indexOf('{');
+        int end = value.lastIndexOf('}');
+        if (start >= 0 && end >= start) {
+            return value.substring(start, end + 1);
         }
+        return value;
     }
 
-    private ResumeFilterConstraints extractResumeFilterConstraintsStrict(String query) {
-        try {
-            String json = metadataFilterAiService.extract(query);
-            JsonNode node = objectMapper.readTree(json);
-            String parentType = normalizeParentType(node.path("parentType").asText(""));
-            String fileName = ResumeTextUtils.safe(node.path("fileName").asText(""));
-            String contentType = ResumeTextUtils.safe(node.path("contentType").asText(""));
-            return new ResumeFilterConstraints(
-                    parentType,
-                    fileName,
-                    contentType,
-                    readKeywordArray(node, "skills"),
-                    readKeywordArray(node, "companies"),
-                    readKeywordArray(node, "schools"),
-                    readKeywordArray(node, "titles"),
-                    readKeywordArray(node, "projects"),
-                    readKeywordArray(node, "industries"),
-                    readKeywordArray(node, "keywords")
-            );
-        } catch (Exception e) {
-            throw new IllegalStateException("提取简历检索约束失败", e);
+    private ResumeFilterConstraints readResumeFilterConstraints(JsonNode node) {
+        if (node == null || node.isMissingNode() || node.isNull()) {
+            return ResumeFilterConstraints.empty();
         }
+        String parentType = normalizeParentType(node.path("parentType").asText(""));
+        String fileName = ResumeTextUtils.safe(node.path("fileName").asText(""));
+        String contentType = ResumeTextUtils.safe(node.path("contentType").asText(""));
+        return new ResumeFilterConstraints(
+                parentType,
+                fileName,
+                contentType,
+                readKeywordArray(node, "skills"),
+                readKeywordArray(node, "companies"),
+                readKeywordArray(node, "schools"),
+                readKeywordArray(node, "titles"),
+                readKeywordArray(node, "projects"),
+                readKeywordArray(node, "industries"),
+                readKeywordArray(node, "keywords")
+        );
     }
 
     private ResumeKeywordMetadata extractResumeKeywordMetadata(String normalizedText) {
@@ -1320,11 +1290,6 @@ public class DocumentLoader {
         if (userId == null || userId.isBlank()) {
             throw new IllegalArgumentException("userId 不能为空");
         }
-    }
-
-    private Intent classifyIntent(String query) {
-        String label = intentClassifier.classify(query);
-        return IntentRoutingUtils.parseIntentLabel(label);
     }
 
     private boolean shouldUseResumeRag(Intent intent) {
@@ -2056,10 +2021,6 @@ public class DocumentLoader {
 
     private String parentBlockCacheKey(Long parentBlockId) {
         return PARENT_BLOCK_CACHE_KEY_PREFIX + parentBlockId;
-    }
-
-    private <T> CompletableFuture<AsyncTimedValue<T>> asyncTimeValue(String taskName, Supplier<T> supplier, T fallbackValue) {
-        return CompletableFuture.supplyAsync(() -> safeTimeValue(taskName, supplier, fallbackValue), aiTaskExecutor);
     }
 
     private <T> AsyncTimedValue<T> safeTimeValue(String taskName, Supplier<T> supplier, T fallbackValue) {
