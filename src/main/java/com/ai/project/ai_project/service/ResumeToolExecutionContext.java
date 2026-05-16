@@ -1,5 +1,8 @@
 package com.ai.project.ai_project.service;
 
+import com.ai.project.ai_project.service.dto.QueryPreprocessing;
+import com.ai.project.ai_project.service.dto.TraceStep;
+
 import java.util.List;
 
 /**
@@ -15,7 +18,7 @@ record ResumeToolExecutionContext(
         String normalizedUserId,
         String userIdKey,
         String originalQuery,
-        DocumentLoader.QueryPreprocessing preprocessing,
-        List<DocumentLoader.TraceStep> steps
+        QueryPreprocessing preprocessing,
+        List<TraceStep> steps
 ) {
 }

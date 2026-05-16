@@ -1,6 +1,11 @@
 package com.ai.project.ai_project.controller;
 
 import com.ai.project.ai_project.service.DocumentLoader;
+import com.ai.project.ai_project.service.dto.BatchUploadResult;
+import com.ai.project.ai_project.service.dto.DeleteResumeResult;
+import com.ai.project.ai_project.service.dto.ResumeDownload;
+import com.ai.project.ai_project.service.dto.ResumeListItem;
+import com.ai.project.ai_project.service.dto.UploadResult;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.io.ByteArrayResource;
@@ -47,7 +52,7 @@ public class DocumentController {
     }
 
     @PostMapping(value = "/upload-resume", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public DocumentLoader.UploadResult uploadResume(@RequestPart("file") MultipartFile file) {
+    public UploadResult uploadResume(@RequestPart("file") MultipartFile file) {
         try {
             return documentLoader.loadResume(DEFAULT_USER_ID, file);
         } catch (IllegalArgumentException e) {
@@ -58,7 +63,7 @@ public class DocumentController {
     }
 
     @PostMapping(value = "/upload-resumes", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public DocumentLoader.BatchUploadResult uploadResumes(@RequestPart("files") MultipartFile[] files) {
+    public BatchUploadResult uploadResumes(@RequestPart("files") MultipartFile[] files) {
         try {
             return documentLoader.loadResumes(DEFAULT_USER_ID, files);
         } catch (IllegalArgumentException e) {
@@ -98,13 +103,13 @@ public class DocumentController {
     }
 
     @GetMapping("/resumes")
-    public java.util.List<DocumentLoader.ResumeListItem> listResumes() {
+    public java.util.List<ResumeListItem> listResumes() {
         return documentLoader.listResumes(DEFAULT_USER_ID);
     }
 
     @DeleteMapping("/resumes/{resumeId}")
-    public DocumentLoader.DeleteResumeResult deleteResume(@RequestParam(defaultValue = "default-user") String userId,
-                                                          @PathVariable Long resumeId) {
+    public DeleteResumeResult deleteResume(@RequestParam(defaultValue = "default-user") String userId,
+                                           @PathVariable Long resumeId) {
         try {
             return documentLoader.deleteResume(userId, resumeId);
         } catch (IllegalArgumentException e) {
@@ -116,7 +121,7 @@ public class DocumentController {
     public ResponseEntity<ByteArrayResource> downloadResume(@RequestParam(defaultValue = "default-user") String userId,
                                                             @PathVariable Long resumeId) {
         try {
-            DocumentLoader.ResumeDownload download = documentLoader.downloadResume(userId, resumeId);
+            ResumeDownload download = documentLoader.downloadResume(userId, resumeId);
             String contentType = download.contentType() == null || download.contentType().isBlank()
                     ? MediaType.APPLICATION_OCTET_STREAM_VALUE
                     : download.contentType();

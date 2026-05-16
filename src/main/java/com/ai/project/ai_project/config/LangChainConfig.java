@@ -1,6 +1,7 @@
 package com.ai.project.ai_project.config;
 
 import com.ai.project.ai_project.event.ChatMemoryPersistEvent;
+import com.ai.project.ai_project.service.ResumeMetadataFilterAiService;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.ChatMessageDeserializer;
 import dev.langchain4j.data.message.ChatMessageSerializer;
@@ -10,6 +11,7 @@ import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
 import dev.langchain4j.community.store.embedding.redis.RedisEmbeddingStore;
+import dev.langchain4j.service.AiServices;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.memory.chat.ChatMemoryStore;
 import org.springframework.beans.factory.annotation.Value;
@@ -60,6 +62,13 @@ public class LangChainConfig {
     @Bean
     public StreamingChatModel streamingChatLanguageModel() {
         return ModelConfig.deepseekStreamingChatModel(deepseekApiKey);
+    }
+
+    @Bean
+    public ResumeMetadataFilterAiService resumeMetadataFilterAiService(ChatModel chatLanguageModel) {
+        return AiServices.builder(ResumeMetadataFilterAiService.class)
+                .chatModel(chatLanguageModel)
+                .build();
     }
 
     @Bean

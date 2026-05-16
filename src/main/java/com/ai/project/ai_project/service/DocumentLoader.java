@@ -4,7 +4,17 @@ import com.ai.project.ai_project.domain.ResumeDocumentEntity;
 import com.ai.project.ai_project.domain.ResumeParentBlockEntity;
 import com.ai.project.ai_project.mapper.ResumeDocumentMapper;
 import com.ai.project.ai_project.mapper.ResumeParentBlockMapper;
-import com.ai.project.ai_project.util.IntentRoutingUtils;
+import com.ai.project.ai_project.service.dto.BatchUploadResult;
+import com.ai.project.ai_project.service.dto.DeleteResumeResult;
+import com.ai.project.ai_project.service.dto.QueryPreprocessing;
+import com.ai.project.ai_project.service.dto.QueryResumeResult;
+import com.ai.project.ai_project.service.dto.ResumeDownload;
+import com.ai.project.ai_project.service.dto.ResumeFilterConstraints;
+import com.ai.project.ai_project.service.dto.ResumeListItem;
+import com.ai.project.ai_project.service.dto.ResumeQueryTrace;
+import com.ai.project.ai_project.service.dto.SkippedUpload;
+import com.ai.project.ai_project.service.dto.TraceStep;
+import com.ai.project.ai_project.service.dto.UploadResult;
 import com.ai.project.ai_project.util.ResumeTextUtils;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -28,6 +38,8 @@ import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.filter.Filter;
 import dev.langchain4j.store.embedding.filter.logical.And;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StopWatch;
@@ -60,13 +72,13 @@ import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
 
 @Service
 public class DocumentLoader {
+    private static final Logger log = LoggerFactory.getLogger(DocumentLoader.class);
 
     private static final Set<String> SUPPORTED_EXTENSIONS = Set.of("pdf", "doc", "docx");
     private static final String SOURCE_TYPE_RESUME = "resume";
@@ -75,21 +87,8 @@ public class DocumentLoader {
     private static final String PARENT_BLOCK_CACHE_KEY_PREFIX = "resume:parent:block:";
     private static final int PARENT_BLOCK_CACHE_TTL_SECONDS = 24 * 60 * 60;
     private static final int RESUME_KEYWORD_TEXT_LIMIT = 12000;
-    private static final int RESUME_QUERY_REWRITE_MAX_LENGTH = 500;
-    private static final int SCORE_CLIFF_MIN_CONTEXTS = 1;
-    private static final int HORIZONTAL_COMPARE_SCORE_CLIFF_MIN_CONTEXTS = 4;
-    private static final double SCORE_CLIFF_RETAIN_RATIO = 0.45d;
-    private static final double SCORE_CLIFF_MIN_GAP = 0.12d;
-    private static final int RESUME_VECTOR_MAX_RESULTS = 50;
-    private static final int HORIZONTAL_COMPARE_VECTOR_MAX_RESULTS = 80;
-    private static final int RESUME_KEYWORD_MAX_RESULTS = 12;
-    private static final int HORIZONTAL_COMPARE_KEYWORD_MAX_RESULTS = 24;
-    private static final int RESUME_PARENT_CONTEXTS = 4;
-    private static final int HORIZONTAL_COMPARE_PARENT_CONTEXTS = 8;
     private static final DocumentSplitter CHILD_SPLITTER = DocumentSplitters.recursive(200, 40);
     private static final Pattern QUERY_TOKEN_SPLITTER = Pattern.compile("[\\s,，。！？；;:：()（）\\-_/\\.]+");
-    private static final Pattern PREPROCESS_INTENT_PATTERN = Pattern.compile("\"?intent\"?\\s*[:：]\\s*\"?([A-Z_]+)\"?", Pattern.CASE_INSENSITIVE);
-    private static final Pattern PREPROCESS_REWRITTEN_QUERY_PATTERN = Pattern.compile("\"?rewrittenQuery\"?\\s*[:：]\\s*(\"(?:\\\\.|[^\"])*\"|[^,}\\r\\n]+)", Pattern.CASE_INSENSITIVE);
     private static final List<String> FAMOUS_SCHOOL_SIGNALS = List.of(
             "985", "211", "双一流", "c9", "清华", "北大", "北京大学", "复旦", "上海交通大学", "上海交大",
             "浙江大学", "浙大", "中国科学技术大学", "中科大", "南京大学", "南大", "哈尔滨工业大学", "哈工大",
@@ -111,6 +110,7 @@ public class DocumentLoader {
     private final ResumeParentBlockMapper resumeParentBlockMapper;
     private final ResumeDocumentMapper resumeDocumentMapper;
     private final ResumeQueryTraceService resumeQueryTraceService;
+    private final ResumeQueryProperties resumeQueryProperties;
     private final Executor aiTaskExecutor;
     private final ApacheTikaDocumentParser parser;
     private final String vectorIndexName;
@@ -118,6 +118,7 @@ public class DocumentLoader {
     private final double vectorRecallWeight;
     private final double keywordRecallWeight;
     private final ResumeMetadataFilterAiService metadataFilterAiService;
+    private final ResumePreprocessingService resumePreprocessingService;
     private final ResumeToolAssistant resumeToolAssistant;
     private final ThreadLocal<ResumeToolExecutionContext> resumeToolExecutionContext = new ThreadLocal<>();
     private final ObjectMapper objectMapper;
@@ -130,6 +131,9 @@ public class DocumentLoader {
                           ResumeParentBlockMapper resumeParentBlockMapper,
                           ResumeDocumentMapper resumeDocumentMapper,
                           ResumeQueryTraceService resumeQueryTraceService,
+                          ResumeQueryProperties resumeQueryProperties,
+                          ResumePreprocessingService resumePreprocessingService,
+                          ResumeMetadataFilterAiService metadataFilterAiService,
                           @Qualifier("aiTaskExecutor") Executor aiTaskExecutor,
                           @org.springframework.beans.factory.annotation.Value("${app.recall.vector-weight:1.0}") double vectorRecallWeight,
                           @org.springframework.beans.factory.annotation.Value("${app.recall.keyword-weight:1.0}") double keywordRecallWeight,
@@ -143,15 +147,15 @@ public class DocumentLoader {
         this.resumeParentBlockMapper = resumeParentBlockMapper;
         this.resumeDocumentMapper = resumeDocumentMapper;
         this.resumeQueryTraceService = resumeQueryTraceService;
+        this.resumeQueryProperties = resumeQueryProperties;
+        this.resumePreprocessingService = resumePreprocessingService;
         this.aiTaskExecutor = aiTaskExecutor;
         this.parser = new ApacheTikaDocumentParser();
         this.vectorRecallWeight = vectorRecallWeight;
         this.keywordRecallWeight = keywordRecallWeight;
         this.vectorIndexName = vectorIndexName;
         this.resumeStorageDir = Path.of(resumeStorageDir);
-        this.metadataFilterAiService = AiServices.builder(ResumeMetadataFilterAiService.class)
-                .chatModel(chatLanguageModel)
-                .build();
+        this.metadataFilterAiService = metadataFilterAiService;
         this.resumeToolAssistant = AiServices.builder(ResumeToolAssistant.class)
                 .chatModel(chatLanguageModel)
                 .tools(new ResumeSearchTools(this))
@@ -440,7 +444,8 @@ public class DocumentLoader {
             boolean isResume = node.path("isResume").asBoolean(false);
             String candidateName = normalizeKeyword(node.path("candidateName").asText(""));
             return new ResumeProfile(isResume, candidateName);
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            log.warn("提取简历主信息失败，回退到关键词启发式判断", e);
             boolean looksLikeResume = containsAnyText(normalizedText, "教育经历", "工作经历", "项目经历", "专业技能", "技能栈", "个人信息");
             return new ResumeProfile(looksLikeResume, "");
         }
@@ -708,11 +713,11 @@ public class DocumentLoader {
         QueryPreprocessing fallback = new QueryPreprocessing(Intent.RESUME_QUERY, ResumeTextUtils.safe(query), ResumeFilterConstraints.empty());
         AsyncTimedValue<QueryPreprocessing> preprocessingStep = safeTimeValue(
                 "query_preprocessing",
-                () -> preprocessResumeQueryStrict(query),
+                () -> resumePreprocessingService.preprocess(query),
                 fallback
         );
         QueryPreprocessing preprocessing = preprocessingStep.value() == null ? fallback : preprocessingStep.value();
-        String rewrittenQuery = normalizeRewrittenQuery(preprocessing.rewrittenQuery());
+        String rewrittenQuery = resumePreprocessingService.normalizeRewrittenQuery(preprocessing.rewrittenQuery());
         if (rewrittenQuery.isBlank()) {
             rewrittenQuery = ResumeTextUtils.safe(query);
         }
@@ -835,10 +840,10 @@ public class DocumentLoader {
                                                            Consumer<String> statusConsumer) {
         StopWatch ragStopWatch = new StopWatch("resume-rag-query");
         ragStopWatch.start("total");
-        int vectorMaxResults = horizontalCompare ? HORIZONTAL_COMPARE_VECTOR_MAX_RESULTS : RESUME_VECTOR_MAX_RESULTS;
-        int keywordMaxResults = horizontalCompare ? HORIZONTAL_COMPARE_KEYWORD_MAX_RESULTS : RESUME_KEYWORD_MAX_RESULTS;
-        int parentContextLimit = horizontalCompare ? HORIZONTAL_COMPARE_PARENT_CONTEXTS : RESUME_PARENT_CONTEXTS;
-        int scoreCliffMinContexts = horizontalCompare ? HORIZONTAL_COMPARE_SCORE_CLIFF_MIN_CONTEXTS : SCORE_CLIFF_MIN_CONTEXTS;
+        int vectorMaxResults = horizontalCompare ? resumeQueryProperties.horizontalCompareVectorMaxResults() : resumeQueryProperties.resumeVectorMaxResults();
+        int keywordMaxResults = horizontalCompare ? resumeQueryProperties.horizontalCompareKeywordMaxResults() : resumeQueryProperties.resumeKeywordMaxResults();
+        int parentContextLimit = horizontalCompare ? resumeQueryProperties.horizontalCompareParentContexts() : resumeQueryProperties.resumeParentContexts();
+        int scoreCliffMinContexts = horizontalCompare ? resumeQueryProperties.horizontalCompareScoreCliffMinContexts() : resumeQueryProperties.scoreCliffMinContexts();
 
         String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
 
@@ -923,57 +928,6 @@ public class DocumentLoader {
         return new ResumeAnswerPreparation(prompt, "", ragStopWatch.getTotalTimeMillis(), hybridResult.contexts().size());
     }
 
-    private QueryPreprocessing preprocessResumeQueryStrict(String query) {
-        String raw = metadataFilterAiService.preprocessResumeQuery(query);
-        try {
-            String json = normalizeJsonObject(raw);
-            JsonNode node = objectMapper.readTree(json);
-            Intent intent = IntentRoutingUtils.parseIntentLabel(node.path("intent").asText(""));
-            String rewrittenQuery = normalizeRewrittenQuery(node.path("rewrittenQuery").asText(query));
-            if (rewrittenQuery.isBlank()) {
-                rewrittenQuery = ResumeTextUtils.safe(query);
-            }
-            ResumeFilterConstraints constraints = readResumeFilterConstraints(node.path("constraints"));
-            return new QueryPreprocessing(intent, rewrittenQuery, constraints);
-        } catch (Exception e) {
-            return recoverPreprocessingFromText(query, raw);
-        }
-    }
-
-    private QueryPreprocessing recoverPreprocessingFromText(String query, String raw) {
-        String safeQuery = ResumeTextUtils.safe(query);
-        Intent intent = extractIntentFromPreprocessingText(raw);
-        String rewrittenQuery = normalizeRewrittenQuery(extractRewrittenQueryFromPreprocessingText(raw));
-        if (rewrittenQuery.isBlank()) {
-            rewrittenQuery = safeQuery;
-        }
-        return new QueryPreprocessing(intent, rewrittenQuery, ResumeFilterConstraints.empty());
-    }
-
-    private Intent extractIntentFromPreprocessingText(String raw) {
-        Matcher matcher = PREPROCESS_INTENT_PATTERN.matcher(ResumeTextUtils.safe(raw));
-        if (!matcher.find()) {
-            return Intent.RESUME_QUERY;
-        }
-        return IntentRoutingUtils.parseIntentLabel(matcher.group(1));
-    }
-
-    private String extractRewrittenQueryFromPreprocessingText(String raw) {
-        Matcher matcher = PREPROCESS_REWRITTEN_QUERY_PATTERN.matcher(ResumeTextUtils.safe(raw));
-        if (!matcher.find()) {
-            return "";
-        }
-        String value = ResumeTextUtils.safe(matcher.group(1));
-        if (value.startsWith("\"") && value.endsWith("\"")) {
-            try {
-                return objectMapper.readTree(value).asText("");
-            } catch (Exception ignored) {
-                return value.substring(1, value.length() - 1);
-            }
-        }
-        return value;
-    }
-
     private QueryResumeExecution completeResumeAnswer(ResumeAnswerPreparation preparation, List<TraceStep> steps) {
         if (!preparation.immediateAnswer().isBlank()) {
             return new QueryResumeExecution(preparation.immediateAnswer(), preparation.preparationElapsedMillis() + sumElapsedMillis(steps));
@@ -1046,10 +1000,14 @@ public class DocumentLoader {
         }
         String finalRetrievalQuery = retrievalQuery;
         boolean horizontalCompare = isHorizontalCompareIntent(context.preprocessing().intent());
-        int parentLimit = clamp(maxParents, 1, horizontalCompare ? HORIZONTAL_COMPARE_PARENT_CONTEXTS : RESUME_PARENT_CONTEXTS);
-        int vectorMaxResults = horizontalCompare || parentLimit > RESUME_PARENT_CONTEXTS ? HORIZONTAL_COMPARE_VECTOR_MAX_RESULTS : RESUME_VECTOR_MAX_RESULTS;
-        int keywordMaxResults = horizontalCompare || parentLimit > RESUME_PARENT_CONTEXTS ? HORIZONTAL_COMPARE_KEYWORD_MAX_RESULTS : RESUME_KEYWORD_MAX_RESULTS;
-        int scoreCliffMinContexts = horizontalCompare ? HORIZONTAL_COMPARE_SCORE_CLIFF_MIN_CONTEXTS : SCORE_CLIFF_MIN_CONTEXTS;
+        int parentLimit = clamp(maxParents, 1, horizontalCompare ? resumeQueryProperties.horizontalCompareParentContexts() : resumeQueryProperties.resumeParentContexts());
+        int vectorMaxResults = horizontalCompare || parentLimit > resumeQueryProperties.resumeParentContexts()
+                ? resumeQueryProperties.horizontalCompareVectorMaxResults()
+                : resumeQueryProperties.resumeVectorMaxResults();
+        int keywordMaxResults = horizontalCompare || parentLimit > resumeQueryProperties.resumeParentContexts()
+                ? resumeQueryProperties.horizontalCompareKeywordMaxResults()
+                : resumeQueryProperties.resumeKeywordMaxResults();
+        int scoreCliffMinContexts = horizontalCompare ? resumeQueryProperties.horizontalCompareScoreCliffMinContexts() : resumeQueryProperties.scoreCliffMinContexts();
         ResumeFilterConstraints constraints = usePreprocessedConstraints
                 ? context.preprocessing().constraints()
                 : ResumeFilterConstraints.empty();
@@ -1222,59 +1180,6 @@ public class DocumentLoader {
         return merged;
     }
 
-    private String normalizeRewrittenQuery(String raw) {
-        String value = ResumeTextUtils.safe(raw)
-                .replaceAll("(?i)^```[a-z]*", "")
-                .replaceAll("```$", "")
-                .replaceAll("[\\r\\n\\t]+", " ")
-                .replaceAll("\\s{2,}", " ")
-                .trim();
-        if ((value.startsWith("\"") && value.endsWith("\""))
-                || (value.startsWith("'") && value.endsWith("'"))
-                || (value.startsWith("“") && value.endsWith("”"))) {
-            value = value.substring(1, value.length() - 1).trim();
-        }
-        if (value.length() > RESUME_QUERY_REWRITE_MAX_LENGTH) {
-            value = value.substring(0, RESUME_QUERY_REWRITE_MAX_LENGTH).trim();
-        }
-        return value;
-    }
-
-    private String normalizeJsonObject(String raw) {
-        String value = ResumeTextUtils.safe(raw)
-                .replaceAll("(?i)^```json", "")
-                .replaceAll("(?i)^```", "")
-                .replaceAll("```$", "")
-                .trim();
-        int start = value.indexOf('{');
-        int end = value.lastIndexOf('}');
-        if (start >= 0 && end >= start) {
-            return value.substring(start, end + 1);
-        }
-        return value;
-    }
-
-    private ResumeFilterConstraints readResumeFilterConstraints(JsonNode node) {
-        if (node == null || node.isMissingNode() || node.isNull()) {
-            return ResumeFilterConstraints.empty();
-        }
-        String parentType = normalizeParentType(node.path("parentType").asText(""));
-        String fileName = ResumeTextUtils.safe(node.path("fileName").asText(""));
-        String contentType = ResumeTextUtils.safe(node.path("contentType").asText(""));
-        return new ResumeFilterConstraints(
-                parentType,
-                fileName,
-                contentType,
-                readKeywordArray(node, "skills"),
-                readKeywordArray(node, "companies"),
-                readKeywordArray(node, "schools"),
-                readKeywordArray(node, "titles"),
-                readKeywordArray(node, "projects"),
-                readKeywordArray(node, "industries"),
-                readKeywordArray(node, "keywords")
-        );
-    }
-
     private ResumeKeywordMetadata extractResumeKeywordMetadata(String normalizedText) {
         try {
             String textForLlm = normalizedText.length() <= RESUME_KEYWORD_TEXT_LIMIT
@@ -1291,7 +1196,8 @@ public class DocumentLoader {
                     readKeywordArray(node, "industries"),
                     readKeywordArray(node, "keywords")
             );
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            log.warn("提取简历 metadata 关键词失败，回退为空关键词", e);
             return ResumeKeywordMetadata.empty();
         }
     }
@@ -1452,7 +1358,8 @@ public class DocumentLoader {
             if (!primary.isEmpty()) {
                 return primary;
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            log.warn("带过滤条件的向量检索失败，回退到无过滤向量检索", e);
             // Fall back to an unfiltered vector search and apply supported filters in memory.
         }
 
@@ -1712,8 +1619,8 @@ public class DocumentLoader {
             return false;
         }
         double scoreGap = previousScore - currentScore;
-        return scoreGap >= SCORE_CLIFF_MIN_GAP
-                && currentScore <= previousScore * SCORE_CLIFF_RETAIN_RATIO;
+        return scoreGap >= resumeQueryProperties.scoreCliffMinGap()
+                && currentScore <= previousScore * resumeQueryProperties.scoreCliffRetainRatio();
     }
 
     private ParentCandidate scoreParentCandidate(ParentCandidate candidate,
@@ -1973,7 +1880,8 @@ public class DocumentLoader {
                     .map(this::toKeywordHit)
                     .filter(hit -> !hit.parentBlockId().isBlank())
                     .toList();
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            log.warn("关键词检索失败，回退为空关键词召回结果", e);
             return List.of();
         }
     }
@@ -2085,8 +1993,8 @@ public class DocumentLoader {
         }
         try {
             Files.deleteIfExists(Path.of(path));
-        } catch (Exception ignored) {
-            // no-op
+        } catch (Exception e) {
+            log.warn("删除简历原文件失败，path={}", path, e);
         }
     }
 
@@ -2145,7 +2053,8 @@ public class DocumentLoader {
         }
         try {
             return unifiedJedis.hget(parentBlockCacheKey(parentBlockId), "content");
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            log.debug("读取父块缓存失败，parentBlockId={}", parentBlockId, e);
             return "";
         }
     }
@@ -2158,8 +2067,8 @@ public class DocumentLoader {
         try {
             unifiedJedis.hset(key, "content", content);
             unifiedJedis.expire(key, PARENT_BLOCK_CACHE_TTL_SECONDS);
-        } catch (Exception ignored) {
-            // Ignore cache write failure and keep DB as source of truth.
+        } catch (Exception e) {
+            log.debug("写入父块缓存失败，parentBlockId={}", parentBlockId, e);
         }
     }
 
@@ -2249,20 +2158,6 @@ public class DocumentLoader {
             long elapsedMillis,
             boolean success,
             String error
-    ) {
-    }
-
-    /**
-     * Tool Agent 执行前生成的三合一查询预处理结果。
-     *
-     * @param intent 用户问题意图
-     * @param rewrittenQuery 由预处理 LLM 改写出的检索查询
-     * @param constraints 从用户问题中提取出的 metadata 约束
-     */
-    record QueryPreprocessing(
-            Intent intent,
-            String rewrittenQuery,
-            ResumeFilterConstraints constraints
     ) {
     }
 
@@ -2374,48 +2269,6 @@ public class DocumentLoader {
     }
 
     /**
-     * 简历检索使用的已清洗 metadata 约束。
-     *
-     * @param parentType 偏好的父块类型，仅允许 project/resume 或空字符串
-     * @param fileName 可选的原始文件名约束
-     * @param contentType 可选的 MIME 类型约束
-     * @param skills 技能和技术栈关键词
-     * @param companies 公司或组织关键词，可包含“大厂”等泛化标签
-     * @param schools 学校或教育背景关键词，可包含“名校”等泛化标签
-     * @param titles 岗位、角色或职级关键词
-     * @param projects 项目、产品或系统关键词
-     * @param industries 行业或业务领域关键词
-     * @param keywords 其他补充检索关键词
-     */
-    record ResumeFilterConstraints(
-            String parentType,
-            String fileName,
-            String contentType,
-            List<String> skills,
-            List<String> companies,
-            List<String> schools,
-            List<String> titles,
-            List<String> projects,
-            List<String> industries,
-            List<String> keywords
-    ) {
-        private static ResumeFilterConstraints empty() {
-            return new ResumeFilterConstraints(
-                    "",
-                    "",
-                    "",
-                    List.of(),
-                    List.of(),
-                    List.of(),
-                    List.of(),
-                    List.of(),
-                    List.of(),
-                    List.of()
-            );
-        }
-    }
-
-    /**
      * 上传简历时由 LLM 读取简历后抽取出的可检索 metadata 关键词。
      */
     private record ResumeKeywordMetadata(
@@ -2438,92 +2291,6 @@ public class DocumentLoader {
                     List.of()
             );
         }
-    }
-
-    public record UploadResult(
-            String userId,
-            Long resumeId,
-            String candidateName,
-            String fileName,
-            int segmentCount,
-            int characterCount,
-            Integer embeddingTokenCount
-    ) {
-    }
-
-    public record BatchUploadResult(
-            String userId,
-            List<UploadResult> uploaded,
-            List<SkippedUpload> skipped
-    ) {
-    }
-
-    public record SkippedUpload(
-            String fileName,
-            String reason
-    ) {
-    }
-
-    public record ResumeDownload(
-            Long resumeId,
-            String candidateName,
-            String fileName,
-            String contentType,
-            byte[] bytes
-    ) {
-    }
-
-    public record ResumeListItem(
-            Long resumeId,
-            String candidateName,
-            String fileName,
-            String contentType,
-            int segmentCount,
-            int characterCount,
-            String uploadedAt
-    ) {
-    }
-
-    public record DeleteResumeResult(
-            String userId,
-            Long resumeId,
-            String candidateName,
-            boolean deleted
-    ) {
-    }
-
-    public record QueryResumeResult(
-            String answer,
-            ResumeQueryTrace trace
-    ) {
-    }
-
-    public record ResumeQueryTrace(
-            String traceId,
-            String userId,
-            String userIdKey,
-            String originalQuery,
-            String rewrittenQuery,
-            String intent,
-            long totalElapsedMillis,
-            List<TraceStep> steps
-    ) {
-    }
-
-    /**
-     * 简历查询 trace 中的单个可观测步骤。
-     *
-     * @param name 稳定的步骤名称
-     * @param elapsedMillis 步骤耗时，单位毫秒
-     * @param tokenCount 估算或模型供应商返回的 token 数量，可为空
-     * @param data 用于调试和前端展示的结构化步骤数据
-     */
-    public record TraceStep(
-            String name,
-            long elapsedMillis,
-            Integer tokenCount,
-            Map<String, Object> data
-    ) {
     }
 
     private record UploadedResumeFile(

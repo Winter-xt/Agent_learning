@@ -2,9 +2,12 @@ package com.ai.project.ai_project.service;
 
 import com.ai.project.ai_project.domain.ResumeQueryTraceEntity;
 import com.ai.project.ai_project.mapper.ResumeQueryTraceMapper;
+import com.ai.project.ai_project.service.dto.ResumeQueryTrace;
 import com.ai.project.ai_project.util.ResumeTextUtils;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
@@ -12,6 +15,7 @@ import java.time.LocalDateTime;
 
 @Service
 public class ResumeQueryTraceService {
+    private static final Logger log = LoggerFactory.getLogger(ResumeQueryTraceService.class);
 
     private static final int ANSWER_PREVIEW_LIMIT = 1200;
 
@@ -30,7 +34,7 @@ public class ResumeQueryTraceService {
                           String rewrittenQuery,
                           String intent,
                           String answer,
-                          DocumentLoader.ResumeQueryTrace trace) {
+                          ResumeQueryTrace trace) {
         try {
             ResumeQueryTraceEntity entity = new ResumeQueryTraceEntity();
             entity.setTraceId(trace.traceId());
@@ -43,12 +47,12 @@ public class ResumeQueryTraceService {
             entity.setTraceJson(toJson(trace));
             entity.setCreatedAt(LocalDateTime.now());
             resumeQueryTraceMapper.insert(entity);
-        } catch (Exception ignored) {
-            // Trace persistence must never break the user-facing query path.
+        } catch (Exception e) {
+            log.warn("保存简历查询 trace 失败，traceId={}", trace == null ? "" : trace.traceId(), e);
         }
     }
 
-    private String toJson(DocumentLoader.ResumeQueryTrace trace) throws JsonProcessingException {
+    private String toJson(ResumeQueryTrace trace) throws JsonProcessingException {
         return objectMapper.writeValueAsString(trace);
     }
 
