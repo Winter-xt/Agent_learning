@@ -30,7 +30,7 @@ public final class ModelConfig {
                 .apiKey(apiKey)
                 .baseUrl("https://api.deepseek.com")
                 .modelName(DEEPSEEK_API_MODEL_NAME)
-                .customParameters(Map.of("extra_body", Map.of("thinking", Map.of("type", "enabled"))))
+                .customParameters(Map.of("thinking", Map.of("type", "disabled")))
                 .build();
     }
 
@@ -46,6 +46,7 @@ public final class ModelConfig {
                 .apiKey(apiKey)
                 .baseUrl("https://api.deepseek.com")
                 .modelName(DEEPSEEK_API_MODEL_NAME)
+                .customParameters(Map.of("thinking", Map.of("type", "disabled")))
                 .build();
     }
 

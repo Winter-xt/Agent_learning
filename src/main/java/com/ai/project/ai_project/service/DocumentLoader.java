@@ -15,6 +15,8 @@ import dev.langchain4j.data.document.parser.apache.tika.ApacheTikaDocumentParser
 import dev.langchain4j.data.document.splitter.DocumentSplitters;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.agent.tool.P;
+import dev.langchain4j.agent.tool.Tool;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
@@ -22,6 +24,8 @@ import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.output.Response;
 import dev.langchain4j.service.AiServices;
+import dev.langchain4j.service.SystemMessage;
+import dev.langchain4j.service.UserMessage;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingStore;
@@ -118,6 +122,8 @@ public class DocumentLoader {
     private final double vectorRecallWeight;
     private final double keywordRecallWeight;
     private final ResumeMetadataFilterAiService metadataFilterAiService;
+    private final ResumeToolAssistant resumeToolAssistant;
+    private final ThreadLocal<ResumeToolExecutionContext> resumeToolExecutionContext = new ThreadLocal<>();
     private final ObjectMapper objectMapper;
 
     public DocumentLoader(ChatModel chatLanguageModel,
@@ -149,6 +155,10 @@ public class DocumentLoader {
         this.resumeStorageDir = Path.of(resumeStorageDir);
         this.metadataFilterAiService = AiServices.builder(ResumeMetadataFilterAiService.class)
                 .chatModel(chatLanguageModel)
+                .build();
+        this.resumeToolAssistant = AiServices.builder(ResumeToolAssistant.class)
+                .chatModel(chatLanguageModel)
+                .tools(new ResumeSearchTools())
                 .build();
         this.objectMapper = new ObjectMapper();
     }
@@ -527,34 +537,10 @@ public class DocumentLoader {
 
         QueryPreprocessing preprocessing = preprocessResumeQuery(query, steps);
         Intent intent = preprocessing.intent();
-        if (shouldUseResumeRag(intent)) {
-            String rewrittenQuery = preprocessing.rewrittenQuery();
-            QueryResumeExecution execution = queryResumeWithRag(normalizedUserId, query, rewrittenQuery, preprocessing.constraints(), isHorizontalCompareIntent(intent), steps);
-            ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, rewrittenQuery, intent.name(), execution.totalElapsedMillis(), steps);
-            resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, rewrittenQuery, intent.name(), execution.answer(), trace);
-            return new QueryResumeResult(execution.answer(), trace);
-        }
-
-        String prompt = """
-                你是一个招聘助手。
-                当前用户在“简历问答”通道提问，但该问题更偏向闲聊或意图不明确。
-                请先简短回应用户，并引导用户提出与简历检索相关的问题，例如：
-                - 候选人有哪些项目经验？
-                - 候选人是否有 Java/Spring 经验？
-                输出时不要使用 Markdown 表格，保持自然段或列表即可。
-
-                用户问题：%s
-                """.formatted(query);
-        TimedValue<String> answerStep = timeValue("chat_model", () -> chatLanguageModel.chat(prompt));
-        steps.add(new TraceStep(
-                "chat_fallback",
-                answerStep.elapsedMillis(),
-                estimateTokenCount(prompt, answerStep.value()),
-                Map.of("reason", "intent_not_resume_rag")
-        ));
-        ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, preprocessing.rewrittenQuery(), intent.name(), sumElapsedMillis(steps), steps);
-        resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, preprocessing.rewrittenQuery(), intent.name(), answerStep.value(), trace);
-        return new QueryResumeResult(answerStep.value(), trace);
+        QueryResumeExecution execution = answerResumeWithToolAgent(normalizedUserId, userIdKey, query, preprocessing, steps);
+        ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, preprocessing.rewrittenQuery(), intent.name(), execution.totalElapsedMillis(), steps);
+        resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, preprocessing.rewrittenQuery(), intent.name(), execution.answer(), trace);
+        return new QueryResumeResult(execution.answer(), trace);
     }
 
     public void queryResumeStream(String userId,
@@ -577,57 +563,14 @@ public class DocumentLoader {
             Intent intent = preprocessing.intent();
 
             String rewrittenQuery = preprocessing.rewrittenQuery();
-            ResumeAnswerPreparation preparation;
-            if (shouldUseResumeRag(intent)) {
-                preparation = prepareResumeRagAnswer(normalizedUserId, query, rewrittenQuery, preprocessing.constraints(), isHorizontalCompareIntent(intent), steps, statusConsumer);
-            } else {
-                statusConsumer.accept("💬 正在组织回复...");
-                String prompt = """
-                        你是一个招聘助手。
-                        当前用户在“简历问答”通道提问，但该问题更偏向闲聊或意图不明确。
-                        请先简短回应用户，并引导用户提出与简历检索相关的问题，例如：
-                        - 候选人有哪些项目经验？
-                        - 候选人是否有 Java/Spring 经验？
-                        输出时不要使用 Markdown 表格，保持自然段或列表即可。
-
-                        用户问题：%s
-                        """.formatted(query);
-                preparation = new ResumeAnswerPreparation(prompt, "", 0L, 0);
-            }
-
-            String finalRewrittenQuery = rewrittenQuery;
-            Intent finalIntent = intent;
-            if (!preparation.immediateAnswer().isBlank()) {
-                String answer = preparation.immediateAnswer();
-                tokenConsumer.accept(answer);
-                steps.add(new TraceStep(
-                        "final_answer",
-                        0L,
-                        estimateTokenCount("", answer),
-                        Map.of("mode", "immediate")
-                ));
-                ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, finalRewrittenQuery, finalIntent.name(), sumElapsedMillis(steps), steps);
-                resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, finalRewrittenQuery, finalIntent.name(), answer, trace);
-                statusConsumer.accept("✅ 查询完成");
-                traceConsumer.accept(trace);
-                completeCallback.run();
-                return;
-            }
-
             statusConsumer.accept("🧠 正在生成答案...");
-            streamResumeAnswer(
-                    preparation,
-                    tokenConsumer,
-                    answer -> {
-                        ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, finalRewrittenQuery, finalIntent.name(), sumElapsedMillis(steps), steps);
-                        resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, finalRewrittenQuery, finalIntent.name(), answer, trace);
-                        statusConsumer.accept("✅ 查询完成");
-                        traceConsumer.accept(trace);
-                        completeCallback.run();
-                    },
-                    errorConsumer,
-                    steps
-            );
+            QueryResumeExecution execution = answerResumeWithToolAgent(normalizedUserId, userIdKey, query, preprocessing, steps);
+            tokenConsumer.accept(execution.answer());
+            ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, rewrittenQuery, intent.name(), execution.totalElapsedMillis(), steps);
+            resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, rewrittenQuery, intent.name(), execution.answer(), trace);
+            statusConsumer.accept("✅ 查询完成");
+            traceConsumer.accept(trace);
+            completeCallback.run();
         } catch (Exception e) {
             errorConsumer.accept(e);
         }
@@ -709,6 +652,51 @@ public class DocumentLoader {
      * 2) 动态构建 LangChain4j Filter 并执行向量/关键词混合召回；
      * 3) 将召回上下文交给模型生成最终答案。
      */
+    private QueryResumeExecution answerResumeWithToolAgent(String normalizedUserId,
+                                                           String userIdKey,
+                                                           String originalQuery,
+                                                           QueryPreprocessing preprocessing,
+                                                           List<TraceStep> steps) {
+        ResumeToolExecutionContext context = new ResumeToolExecutionContext(normalizedUserId, userIdKey, originalQuery, preprocessing, steps);
+        resumeToolExecutionContext.set(context);
+        String prompt = buildResumeToolAgentPrompt(originalQuery, preprocessing);
+        try {
+            TimedValue<String> answerStep = timeValue("tool_agent_chat_model", () -> resumeToolAssistant.answer(prompt));
+            steps.add(new TraceStep(
+                    "final_answer",
+                    answerStep.elapsedMillis(),
+                    estimateTokenCount(prompt, answerStep.value()),
+                    traceData(
+                            "promptCharacters", prompt.length(),
+                            "mode", "tool_agent"
+                    )
+            ));
+            return new QueryResumeExecution(answerStep.value(), sumElapsedMillis(steps));
+        } finally {
+            resumeToolExecutionContext.remove();
+        }
+    }
+
+    private String buildResumeToolAgentPrompt(String originalQuery, QueryPreprocessing preprocessing) {
+        return """
+                用户原始问题：
+                %s
+
+                三合一预处理结果：
+                - intent: %s
+                - rewrittenQuery: %s
+                - constraints: %s
+
+                请基于用户问题作答。你可以自行决定是否调用工具、调用哪个工具、调用多少次以及每次检索多少上下文。
+                如果需要简历证据，请优先用 rewrittenQuery 调用简历检索工具；如果要了解当前用户有哪些简历，可调用简历列表工具。
+                """.formatted(
+                ResumeTextUtils.safe(originalQuery),
+                preprocessing.intent().name(),
+                preprocessing.rewrittenQuery(),
+                preprocessing.constraints()
+        );
+    }
+
     private QueryResumeExecution queryResumeWithRag(String normalizedUserId,
                                                     String originalQuery,
                                                     String retrievalQuery,
@@ -1052,6 +1040,155 @@ public class DocumentLoader {
                 errorConsumer.accept(error);
             }
         });
+    }
+
+    private interface ResumeToolAssistant {
+        @SystemMessage("""
+                你是一个可以自主调用工具的简历分析助手。
+                用户已经经过一次预处理，你会收到原始问题、重写后的检索问题、意图和约束信息。
+
+                工具使用规则：
+                1. 如果回答需要简历事实、候选人证据、项目/技能/教育/经历信息，必须调用简历检索工具。
+                2. 你可以根据需要多次调用简历检索工具，例如分别检索不同候选人、不同技能或不同对比维度。
+                3. 你可以自行决定每次检索多少上下文；横向对比、排序、多个候选人比较时应检索更多上下文。
+                4. 如果只是闲聊或明显不需要简历数据，可以不调用检索工具，并引导用户提出简历相关问题。
+                5. 不要编造工具结果中没有的信息。
+
+                输出规则：
+                1. 如果 intent 是 HORIZONTAL_COMPARE，必须使用 Markdown 表格横向对比，维度对齐，并在表格后给出明确结论；证据不足时说明缺口，不要强行排序。
+                2. 其他简历查询不要使用 Markdown 表格，使用编号列表和小标题输出。
+                3. 涉及候选人时尽量给出 downloadUrl。
+                """)
+        String answer(@UserMessage String userMessage);
+    }
+
+    private class ResumeSearchTools {
+
+        @Tool("检索当前用户已上传的简历上下文。参数 query 是检索问题；maxParents 是希望返回的父块数量，普通查询建议 3 到 4，横向对比建议 6 到 8；usePreprocessedConstraints 表示是否使用预处理提取出的 metadata 约束。")
+        public String searchResumeContexts(@P(value = "检索问题，优先使用预处理后的 rewrittenQuery，也可以为了多轮检索拆成更具体的子问题", required = true) String query,
+                                           @P(value = "希望返回的父块数量，普通查询建议 3 到 4，横向对比建议 6 到 8", required = true) int maxParents,
+                                           @P(value = "是否使用三合一预处理提取出的 metadata 约束；当你拆分了新子问题时可设为 false", required = true) boolean usePreprocessedConstraints) {
+            ResumeToolExecutionContext context = currentResumeToolContext();
+            String retrievalQuery = ResumeTextUtils.safe(query);
+            if (retrievalQuery.isBlank()) {
+                retrievalQuery = context.preprocessing().rewrittenQuery();
+            }
+            String finalRetrievalQuery = retrievalQuery;
+            boolean horizontalCompare = isHorizontalCompareIntent(context.preprocessing().intent());
+            int parentLimit = clamp(maxParents, 1, horizontalCompare ? HORIZONTAL_COMPARE_PARENT_CONTEXTS : RESUME_PARENT_CONTEXTS);
+            int vectorMaxResults = horizontalCompare || parentLimit > RESUME_PARENT_CONTEXTS ? HORIZONTAL_COMPARE_VECTOR_MAX_RESULTS : RESUME_VECTOR_MAX_RESULTS;
+            int keywordMaxResults = horizontalCompare || parentLimit > RESUME_PARENT_CONTEXTS ? HORIZONTAL_COMPARE_KEYWORD_MAX_RESULTS : RESUME_KEYWORD_MAX_RESULTS;
+            int scoreCliffMinContexts = horizontalCompare ? HORIZONTAL_COMPARE_SCORE_CLIFF_MIN_CONTEXTS : SCORE_CLIFF_MIN_CONTEXTS;
+            ResumeFilterConstraints constraints = usePreprocessedConstraints
+                    ? context.preprocessing().constraints()
+                    : ResumeFilterConstraints.empty();
+
+            TimedValue<String> toolStep = timeValue("resume_tool_search", () -> searchResumeContextsForTool(
+                    context.normalizedUserId(),
+                    context.userIdKey(),
+                    finalRetrievalQuery,
+                    constraints,
+                    vectorMaxResults,
+                    keywordMaxResults,
+                    parentLimit,
+                    scoreCliffMinContexts
+            ));
+            context.steps().add(new TraceStep(
+                    "resume_tool_search",
+                    toolStep.elapsedMillis(),
+                    estimateTokenCount("", toolStep.value()),
+                    traceData(
+                            "query", retrievalQuery,
+                            "maxParents", parentLimit,
+                            "usePreprocessedConstraints", usePreprocessedConstraints,
+                            "returnedCharacters", toolStep.value().length()
+                    )
+            ));
+            return toolStep.value();
+        }
+
+        @Tool("列出当前用户已上传的简历基础信息，用于先了解候选人池或确认有哪些简历。")
+        public String listUploadedResumes(@P(value = "最多返回多少份简历基础信息", required = true) int limit) {
+            ResumeToolExecutionContext context = currentResumeToolContext();
+            int maxItems = clamp(limit, 1, 50);
+            TimedValue<List<ResumeListItem>> listStep = timeValue("resume_tool_list_resumes", () -> listResumes(context.normalizedUserId()));
+            List<ResumeListItem> items = listStep.value().stream().limit(maxItems).toList();
+            context.steps().add(new TraceStep(
+                    "resume_tool_list_resumes",
+                    listStep.elapsedMillis(),
+                    null,
+                    traceData("limit", maxItems, "returned", items.size())
+            ));
+            if (items.isEmpty()) {
+                return "当前用户没有已上传的简历。";
+            }
+            List<String> lines = new ArrayList<>();
+            for (ResumeListItem item : items) {
+                lines.add("- resumeId=" + item.resumeId()
+                        + ", candidateName=" + item.candidateName()
+                        + ", fileName=" + item.fileName()
+                        + ", segmentCount=" + item.segmentCount()
+                        + ", downloadUrl=/api/documents/resumes/" + item.resumeId() + "/download");
+            }
+            return String.join("\n", lines);
+        }
+    }
+
+    private ResumeToolExecutionContext currentResumeToolContext() {
+        ResumeToolExecutionContext context = resumeToolExecutionContext.get();
+        if (context == null) {
+            throw new IllegalStateException("Resume tool execution context is missing");
+        }
+        return context;
+    }
+
+    private String searchResumeContextsForTool(String normalizedUserId,
+                                               String userIdKey,
+                                               String retrievalQuery,
+                                               ResumeFilterConstraints constraints,
+                                               int vectorMaxResults,
+                                               int keywordMaxResults,
+                                               int parentContextLimit,
+                                               int scoreCliffMinContexts) {
+        RetrievalResults retrievalResults = retrieveResumeMatchesInParallel(normalizedUserId, userIdKey, retrievalQuery, constraints, vectorMaxResults, keywordMaxResults);
+        ResumeToolExecutionContext context = currentResumeToolContext();
+        context.steps().addAll(retrievalResults.steps());
+        HybridContextResult hybridResult = collectHybridParentContexts(
+                retrievalResults.vectorMatches(),
+                retrievalResults.keywordHits(),
+                retrievalQuery,
+                constraints,
+                parentContextLimit,
+                scoreCliffMinContexts
+        );
+        context.steps().add(new TraceStep("resume_tool_rerank_and_token_funnel", 0L, null, hybridResult.traceData()));
+        if (hybridResult.contexts().isEmpty() && retrievalResults.queryEmbedding() != null) {
+            EmbeddingSearchRequest relaxedRequest = buildResumeSearchRequest(retrievalResults.queryEmbedding(), buildBaseResumeFilter(normalizedUserId), vectorMaxResults, 0.7);
+            TimedValue<List<EmbeddingMatch<TextSegment>>> relaxedVectorStep = timeValue("resume_tool_vector_retrieval_relaxed", () -> searchVectorMatchesWithFallback(relaxedRequest, userIdKey, ResumeFilterConstraints.empty()));
+            context.steps().add(new TraceStep(
+                    "resume_tool_vector_retrieval_relaxed",
+                    relaxedVectorStep.elapsedMillis(),
+                    null,
+                    traceData("topN", vectorMaxResults, "returned", relaxedVectorStep.value().size(), "matches", toVectorTraceItems(relaxedVectorStep.value()))
+            ));
+            hybridResult = collectHybridParentContexts(
+                    relaxedVectorStep.value(),
+                    retrievalResults.keywordHits(),
+                    retrievalQuery,
+                    ResumeFilterConstraints.empty(),
+                    parentContextLimit,
+                    scoreCliffMinContexts
+            );
+            context.steps().add(new TraceStep("resume_tool_rerank_and_token_funnel_relaxed", 0L, null, hybridResult.traceData()));
+        }
+        if (hybridResult.contexts().isEmpty()) {
+            return "未检索到相关简历上下文。";
+        }
+        return String.join("\n\n---\n\n", hybridResult.contexts());
+    }
+
+    private int clamp(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
     }
 
     private EmbeddingSearchRequest buildResumeSearchRequest(Embedding queryEmbedding, Filter filter, int maxResults, double minScore) {
@@ -2150,6 +2287,15 @@ public class DocumentLoader {
             Intent intent,
             String rewrittenQuery,
             ResumeFilterConstraints constraints
+    ) {
+    }
+
+    private record ResumeToolExecutionContext(
+            String normalizedUserId,
+            String userIdKey,
+            String originalQuery,
+            QueryPreprocessing preprocessing,
+            List<TraceStep> steps
     ) {
     }
 
