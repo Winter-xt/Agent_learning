@@ -60,6 +60,7 @@ import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
@@ -87,6 +88,8 @@ public class DocumentLoader {
     private static final int HORIZONTAL_COMPARE_PARENT_CONTEXTS = 8;
     private static final DocumentSplitter CHILD_SPLITTER = DocumentSplitters.recursive(200, 40);
     private static final Pattern QUERY_TOKEN_SPLITTER = Pattern.compile("[\\s,，。！？；;:：()（）\\-_/\\.]+");
+    private static final Pattern PREPROCESS_INTENT_PATTERN = Pattern.compile("\"?intent\"?\\s*[:：]\\s*\"?([A-Z_]+)\"?", Pattern.CASE_INSENSITIVE);
+    private static final Pattern PREPROCESS_REWRITTEN_QUERY_PATTERN = Pattern.compile("\"?rewrittenQuery\"?\\s*[:：]\\s*(\"(?:\\\\.|[^\"])*\"|[^,}\\r\\n]+)", Pattern.CASE_INSENSITIVE);
     private static final List<String> FAMOUS_SCHOOL_SIGNALS = List.of(
             "985", "211", "双一流", "c9", "清华", "北大", "北京大学", "复旦", "上海交通大学", "上海交大",
             "浙江大学", "浙大", "中国科学技术大学", "中科大", "南京大学", "南大", "哈尔滨工业大学", "哈工大",
@@ -718,7 +721,7 @@ public class DocumentLoader {
     }
 
     private QueryPreprocessing preprocessResumeQuery(String query, List<TraceStep> steps) {
-        QueryPreprocessing fallback = new QueryPreprocessing(Intent.UNKNOWN, ResumeTextUtils.safe(query), ResumeFilterConstraints.empty());
+        QueryPreprocessing fallback = new QueryPreprocessing(Intent.RESUME_QUERY, ResumeTextUtils.safe(query), ResumeFilterConstraints.empty());
         AsyncTimedValue<QueryPreprocessing> preprocessingStep = safeTimeValue(
                 "query_preprocessing",
                 () -> preprocessResumeQueryStrict(query),
@@ -937,8 +940,9 @@ public class DocumentLoader {
     }
 
     private QueryPreprocessing preprocessResumeQueryStrict(String query) {
+        String raw = metadataFilterAiService.preprocessResumeQuery(query);
         try {
-            String json = normalizeJsonObject(metadataFilterAiService.preprocessResumeQuery(query));
+            String json = normalizeJsonObject(raw);
             JsonNode node = objectMapper.readTree(json);
             Intent intent = IntentRoutingUtils.parseIntentLabel(node.path("intent").asText(""));
             String rewrittenQuery = normalizeRewrittenQuery(node.path("rewrittenQuery").asText(query));
@@ -948,8 +952,42 @@ public class DocumentLoader {
             ResumeFilterConstraints constraints = readResumeFilterConstraints(node.path("constraints"));
             return new QueryPreprocessing(intent, rewrittenQuery, constraints);
         } catch (Exception e) {
-            throw new IllegalStateException("简历查询预处理失败", e);
+            return recoverPreprocessingFromText(query, raw);
         }
+    }
+
+    private QueryPreprocessing recoverPreprocessingFromText(String query, String raw) {
+        String safeQuery = ResumeTextUtils.safe(query);
+        Intent intent = extractIntentFromPreprocessingText(raw);
+        String rewrittenQuery = normalizeRewrittenQuery(extractRewrittenQueryFromPreprocessingText(raw));
+        if (rewrittenQuery.isBlank()) {
+            rewrittenQuery = safeQuery;
+        }
+        return new QueryPreprocessing(intent, rewrittenQuery, ResumeFilterConstraints.empty());
+    }
+
+    private Intent extractIntentFromPreprocessingText(String raw) {
+        Matcher matcher = PREPROCESS_INTENT_PATTERN.matcher(ResumeTextUtils.safe(raw));
+        if (!matcher.find()) {
+            return Intent.RESUME_QUERY;
+        }
+        return IntentRoutingUtils.parseIntentLabel(matcher.group(1));
+    }
+
+    private String extractRewrittenQueryFromPreprocessingText(String raw) {
+        Matcher matcher = PREPROCESS_REWRITTEN_QUERY_PATTERN.matcher(ResumeTextUtils.safe(raw));
+        if (!matcher.find()) {
+            return "";
+        }
+        String value = ResumeTextUtils.safe(matcher.group(1));
+        if (value.startsWith("\"") && value.endsWith("\"")) {
+            try {
+                return objectMapper.readTree(value).asText("");
+            } catch (Exception ignored) {
+                return value.substring(1, value.length() - 1);
+            }
+        }
+        return value;
     }
 
     private QueryResumeExecution completeResumeAnswer(ResumeAnswerPreparation preparation, List<TraceStep> steps) {
