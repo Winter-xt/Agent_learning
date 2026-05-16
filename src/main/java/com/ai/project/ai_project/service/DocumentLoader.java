@@ -15,8 +15,6 @@ import dev.langchain4j.data.document.parser.apache.tika.ApacheTikaDocumentParser
 import dev.langchain4j.data.document.splitter.DocumentSplitters;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.agent.tool.P;
-import dev.langchain4j.agent.tool.Tool;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
@@ -24,8 +22,6 @@ import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.output.Response;
 import dev.langchain4j.service.AiServices;
-import dev.langchain4j.service.SystemMessage;
-import dev.langchain4j.service.UserMessage;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingStore;
@@ -158,7 +154,7 @@ public class DocumentLoader {
                 .build();
         this.resumeToolAssistant = AiServices.builder(ResumeToolAssistant.class)
                 .chatModel(chatLanguageModel)
-                .tools(new ResumeSearchTools())
+                .tools(new ResumeSearchTools(this))
                 .build();
         this.objectMapper = new ObjectMapper();
     }
@@ -1042,96 +1038,69 @@ public class DocumentLoader {
         });
     }
 
-    private interface ResumeToolAssistant {
-        @SystemMessage("""
-                你是一个可以自主调用工具的简历分析助手。
-                用户已经经过一次预处理，你会收到原始问题、重写后的检索问题、意图和约束信息。
+    String searchResumeContextsFromTool(String query, int maxParents, boolean usePreprocessedConstraints) {
+        ResumeToolExecutionContext context = currentResumeToolContext();
+        String retrievalQuery = ResumeTextUtils.safe(query);
+        if (retrievalQuery.isBlank()) {
+            retrievalQuery = context.preprocessing().rewrittenQuery();
+        }
+        String finalRetrievalQuery = retrievalQuery;
+        boolean horizontalCompare = isHorizontalCompareIntent(context.preprocessing().intent());
+        int parentLimit = clamp(maxParents, 1, horizontalCompare ? HORIZONTAL_COMPARE_PARENT_CONTEXTS : RESUME_PARENT_CONTEXTS);
+        int vectorMaxResults = horizontalCompare || parentLimit > RESUME_PARENT_CONTEXTS ? HORIZONTAL_COMPARE_VECTOR_MAX_RESULTS : RESUME_VECTOR_MAX_RESULTS;
+        int keywordMaxResults = horizontalCompare || parentLimit > RESUME_PARENT_CONTEXTS ? HORIZONTAL_COMPARE_KEYWORD_MAX_RESULTS : RESUME_KEYWORD_MAX_RESULTS;
+        int scoreCliffMinContexts = horizontalCompare ? HORIZONTAL_COMPARE_SCORE_CLIFF_MIN_CONTEXTS : SCORE_CLIFF_MIN_CONTEXTS;
+        ResumeFilterConstraints constraints = usePreprocessedConstraints
+                ? context.preprocessing().constraints()
+                : ResumeFilterConstraints.empty();
 
-                工具使用规则：
-                1. 如果回答需要简历事实、候选人证据、项目/技能/教育/经历信息，必须调用简历检索工具。
-                2. 你可以根据需要多次调用简历检索工具，例如分别检索不同候选人、不同技能或不同对比维度。
-                3. 你可以自行决定每次检索多少上下文；横向对比、排序、多个候选人比较时应检索更多上下文。
-                4. 如果只是闲聊或明显不需要简历数据，可以不调用检索工具，并引导用户提出简历相关问题。
-                5. 不要编造工具结果中没有的信息。
-
-                输出规则：
-                1. 如果 intent 是 HORIZONTAL_COMPARE，必须使用 Markdown 表格横向对比，维度对齐，并在表格后给出明确结论；证据不足时说明缺口，不要强行排序。
-                2. 其他简历查询不要使用 Markdown 表格，使用编号列表和小标题输出。
-                3. 涉及候选人时尽量给出 downloadUrl。
-                """)
-        String answer(@UserMessage String userMessage);
+        TimedValue<String> toolStep = timeValue("resume_tool_search", () -> searchResumeContextsForTool(
+                context.normalizedUserId(),
+                context.userIdKey(),
+                finalRetrievalQuery,
+                constraints,
+                vectorMaxResults,
+                keywordMaxResults,
+                parentLimit,
+                scoreCliffMinContexts
+        ));
+        context.steps().add(new TraceStep(
+                "resume_tool_search",
+                toolStep.elapsedMillis(),
+                estimateTokenCount("", toolStep.value()),
+                traceData(
+                        "query", retrievalQuery,
+                        "maxParents", parentLimit,
+                        "usePreprocessedConstraints", usePreprocessedConstraints,
+                        "returnedCharacters", toolStep.value().length()
+                )
+        ));
+        return toolStep.value();
     }
 
-    private class ResumeSearchTools {
-
-        @Tool("检索当前用户已上传的简历上下文。参数 query 是检索问题；maxParents 是希望返回的父块数量，普通查询建议 3 到 4，横向对比建议 6 到 8；usePreprocessedConstraints 表示是否使用预处理提取出的 metadata 约束。")
-        public String searchResumeContexts(@P(value = "检索问题，优先使用预处理后的 rewrittenQuery，也可以为了多轮检索拆成更具体的子问题", required = true) String query,
-                                           @P(value = "希望返回的父块数量，普通查询建议 3 到 4，横向对比建议 6 到 8", required = true) int maxParents,
-                                           @P(value = "是否使用三合一预处理提取出的 metadata 约束；当你拆分了新子问题时可设为 false", required = true) boolean usePreprocessedConstraints) {
-            ResumeToolExecutionContext context = currentResumeToolContext();
-            String retrievalQuery = ResumeTextUtils.safe(query);
-            if (retrievalQuery.isBlank()) {
-                retrievalQuery = context.preprocessing().rewrittenQuery();
-            }
-            String finalRetrievalQuery = retrievalQuery;
-            boolean horizontalCompare = isHorizontalCompareIntent(context.preprocessing().intent());
-            int parentLimit = clamp(maxParents, 1, horizontalCompare ? HORIZONTAL_COMPARE_PARENT_CONTEXTS : RESUME_PARENT_CONTEXTS);
-            int vectorMaxResults = horizontalCompare || parentLimit > RESUME_PARENT_CONTEXTS ? HORIZONTAL_COMPARE_VECTOR_MAX_RESULTS : RESUME_VECTOR_MAX_RESULTS;
-            int keywordMaxResults = horizontalCompare || parentLimit > RESUME_PARENT_CONTEXTS ? HORIZONTAL_COMPARE_KEYWORD_MAX_RESULTS : RESUME_KEYWORD_MAX_RESULTS;
-            int scoreCliffMinContexts = horizontalCompare ? HORIZONTAL_COMPARE_SCORE_CLIFF_MIN_CONTEXTS : SCORE_CLIFF_MIN_CONTEXTS;
-            ResumeFilterConstraints constraints = usePreprocessedConstraints
-                    ? context.preprocessing().constraints()
-                    : ResumeFilterConstraints.empty();
-
-            TimedValue<String> toolStep = timeValue("resume_tool_search", () -> searchResumeContextsForTool(
-                    context.normalizedUserId(),
-                    context.userIdKey(),
-                    finalRetrievalQuery,
-                    constraints,
-                    vectorMaxResults,
-                    keywordMaxResults,
-                    parentLimit,
-                    scoreCliffMinContexts
-            ));
-            context.steps().add(new TraceStep(
-                    "resume_tool_search",
-                    toolStep.elapsedMillis(),
-                    estimateTokenCount("", toolStep.value()),
-                    traceData(
-                            "query", retrievalQuery,
-                            "maxParents", parentLimit,
-                            "usePreprocessedConstraints", usePreprocessedConstraints,
-                            "returnedCharacters", toolStep.value().length()
-                    )
-            ));
-            return toolStep.value();
+    String listUploadedResumesFromTool(int limit) {
+        ResumeToolExecutionContext context = currentResumeToolContext();
+        int maxItems = clamp(limit, 1, 50);
+        TimedValue<List<ResumeListItem>> listStep = timeValue("resume_tool_list_resumes", () -> listResumes(context.normalizedUserId()));
+        List<ResumeListItem> items = listStep.value().stream().limit(maxItems).toList();
+        context.steps().add(new TraceStep(
+                "resume_tool_list_resumes",
+                listStep.elapsedMillis(),
+                null,
+                traceData("limit", maxItems, "returned", items.size())
+        ));
+        if (items.isEmpty()) {
+            return "当前用户没有已上传的简历。";
         }
-
-        @Tool("列出当前用户已上传的简历基础信息，用于先了解候选人池或确认有哪些简历。")
-        public String listUploadedResumes(@P(value = "最多返回多少份简历基础信息", required = true) int limit) {
-            ResumeToolExecutionContext context = currentResumeToolContext();
-            int maxItems = clamp(limit, 1, 50);
-            TimedValue<List<ResumeListItem>> listStep = timeValue("resume_tool_list_resumes", () -> listResumes(context.normalizedUserId()));
-            List<ResumeListItem> items = listStep.value().stream().limit(maxItems).toList();
-            context.steps().add(new TraceStep(
-                    "resume_tool_list_resumes",
-                    listStep.elapsedMillis(),
-                    null,
-                    traceData("limit", maxItems, "returned", items.size())
-            ));
-            if (items.isEmpty()) {
-                return "当前用户没有已上传的简历。";
-            }
-            List<String> lines = new ArrayList<>();
-            for (ResumeListItem item : items) {
-                lines.add("- resumeId=" + item.resumeId()
-                        + ", candidateName=" + item.candidateName()
-                        + ", fileName=" + item.fileName()
-                        + ", segmentCount=" + item.segmentCount()
-                        + ", downloadUrl=/api/documents/resumes/" + item.resumeId() + "/download");
-            }
-            return String.join("\n", lines);
+        List<String> lines = new ArrayList<>();
+        for (ResumeListItem item : items) {
+            lines.add("- resumeId=" + item.resumeId()
+                    + ", candidateName=" + item.candidateName()
+                    + ", fileName=" + item.fileName()
+                    + ", segmentCount=" + item.segmentCount()
+                    + ", downloadUrl=/api/documents/resumes/" + item.resumeId() + "/download");
         }
+        return String.join("\n", lines);
     }
 
     private ResumeToolExecutionContext currentResumeToolContext() {
@@ -2283,19 +2252,17 @@ public class DocumentLoader {
     ) {
     }
 
-    private record QueryPreprocessing(
+    /**
+     * Tool Agent 执行前生成的三合一查询预处理结果。
+     *
+     * @param intent 用户问题意图
+     * @param rewrittenQuery 由预处理 LLM 改写出的检索查询
+     * @param constraints 从用户问题中提取出的 metadata 约束
+     */
+    record QueryPreprocessing(
             Intent intent,
             String rewrittenQuery,
             ResumeFilterConstraints constraints
-    ) {
-    }
-
-    private record ResumeToolExecutionContext(
-            String normalizedUserId,
-            String userIdKey,
-            String originalQuery,
-            QueryPreprocessing preprocessing,
-            List<TraceStep> steps
     ) {
     }
 
@@ -2407,9 +2374,20 @@ public class DocumentLoader {
     }
 
     /**
-     * LLM 提取后的可用 metadata 约束。
+     * 简历检索使用的已清洗 metadata 约束。
+     *
+     * @param parentType 偏好的父块类型，仅允许 project/resume 或空字符串
+     * @param fileName 可选的原始文件名约束
+     * @param contentType 可选的 MIME 类型约束
+     * @param skills 技能和技术栈关键词
+     * @param companies 公司或组织关键词，可包含“大厂”等泛化标签
+     * @param schools 学校或教育背景关键词，可包含“名校”等泛化标签
+     * @param titles 岗位、角色或职级关键词
+     * @param projects 项目、产品或系统关键词
+     * @param industries 行业或业务领域关键词
+     * @param keywords 其他补充检索关键词
      */
-    private record ResumeFilterConstraints(
+    record ResumeFilterConstraints(
             String parentType,
             String fileName,
             String contentType,
@@ -2532,6 +2510,14 @@ public class DocumentLoader {
     ) {
     }
 
+    /**
+     * 简历查询 trace 中的单个可观测步骤。
+     *
+     * @param name 稳定的步骤名称
+     * @param elapsedMillis 步骤耗时，单位毫秒
+     * @param tokenCount 估算或模型供应商返回的 token 数量，可为空
+     * @param data 用于调试和前端展示的结构化步骤数据
+     */
     public record TraceStep(
             String name,
             long elapsedMillis,
