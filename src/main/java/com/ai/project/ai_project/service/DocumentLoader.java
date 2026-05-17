@@ -538,7 +538,8 @@ public class DocumentLoader {
 
         QueryPreprocessing preprocessing = preprocessResumeQuery(query, steps);
         Intent intent = preprocessing.intent();
-        QueryResumeExecution execution = answerResumeWithToolAgent(normalizedUserId, userIdKey, query, preprocessing, steps);
+        QueryResumeExecution execution = answerResumeWithToolAgent(normalizedUserId, userIdKey, query, preprocessing, steps, status -> {
+        });
         ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, preprocessing.rewrittenQuery(), intent.name(), execution.totalElapsedMillis(), steps);
         resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, preprocessing.rewrittenQuery(), intent.name(), execution.answer(), trace);
         return new QueryResumeResult(execution.answer(), trace);
@@ -565,7 +566,7 @@ public class DocumentLoader {
 
             String rewrittenQuery = preprocessing.rewrittenQuery();
             statusConsumer.accept("🧠 正在生成答案...");
-            QueryResumeExecution execution = answerResumeWithToolAgent(normalizedUserId, userIdKey, query, preprocessing, steps);
+            QueryResumeExecution execution = answerResumeWithToolAgent(normalizedUserId, userIdKey, query, preprocessing, steps, statusConsumer);
             tokenConsumer.accept(execution.answer());
             ResumeQueryTrace trace = new ResumeQueryTrace(traceId, normalizedUserId, userIdKey, query, rewrittenQuery, intent.name(), execution.totalElapsedMillis(), steps);
             resumeQueryTraceService.saveAsync(normalizedUserId, userIdKey, query, rewrittenQuery, intent.name(), execution.answer(), trace);
@@ -657,8 +658,9 @@ public class DocumentLoader {
                                                            String userIdKey,
                                                            String originalQuery,
                                                            QueryPreprocessing preprocessing,
-                                                           List<TraceStep> steps) {
-        ResumeToolExecutionContext context = new ResumeToolExecutionContext(normalizedUserId, userIdKey, originalQuery, preprocessing, steps);
+                                                           List<TraceStep> steps,
+                                                           Consumer<String> statusConsumer) {
+        ResumeToolExecutionContext context = new ResumeToolExecutionContext(normalizedUserId, userIdKey, originalQuery, preprocessing, steps, statusConsumer);
         resumeToolExecutionContext.set(context);
         String prompt = buildResumeToolAgentPrompt(originalQuery, preprocessing);
         try {
@@ -1012,6 +1014,7 @@ public class DocumentLoader {
                 ? context.preprocessing().constraints()
                 : ResumeFilterConstraints.empty();
 
+        acceptToolStatus(context, "🔎 正在检索简历上下文...");
         TimedValue<String> toolStep = timeValue("resume_tool_search", () -> searchResumeContextsForTool(
                 context.normalizedUserId(),
                 context.userIdKey(),
@@ -1039,6 +1042,7 @@ public class DocumentLoader {
     String listUploadedResumesFromTool(int limit) {
         ResumeToolExecutionContext context = currentResumeToolContext();
         int maxItems = clamp(limit, 1, 50);
+        acceptToolStatus(context, "📄 正在读取已上传简历列表...");
         TimedValue<List<ResumeListItem>> listStep = timeValue("resume_tool_list_resumes", () -> listResumes(context.normalizedUserId()));
         List<ResumeListItem> items = listStep.value().stream().limit(maxItems).toList();
         context.steps().add(new TraceStep(
@@ -1069,6 +1073,12 @@ public class DocumentLoader {
         return context;
     }
 
+    private void acceptToolStatus(ResumeToolExecutionContext context, String status) {
+        if (context != null && context.statusConsumer() != null) {
+            context.statusConsumer().accept(status);
+        }
+    }
+
     private String searchResumeContextsForTool(String normalizedUserId,
                                                String userIdKey,
                                                String retrievalQuery,
@@ -1077,9 +1087,11 @@ public class DocumentLoader {
                                                int keywordMaxResults,
                                                int parentContextLimit,
                                                int scoreCliffMinContexts) {
-        RetrievalResults retrievalResults = retrieveResumeMatchesInParallel(normalizedUserId, userIdKey, retrievalQuery, constraints, vectorMaxResults, keywordMaxResults);
         ResumeToolExecutionContext context = currentResumeToolContext();
+        acceptToolStatus(context, "📐 正在并行进行向量检索和关键词检索...");
+        RetrievalResults retrievalResults = retrieveResumeMatchesInParallel(normalizedUserId, userIdKey, retrievalQuery, constraints, vectorMaxResults, keywordMaxResults);
         context.steps().addAll(retrievalResults.steps());
+        acceptToolStatus(context, "⚖️ 正在重排序候选片段...");
         HybridContextResult hybridResult = collectHybridParentContexts(
                 retrievalResults.vectorMatches(),
                 retrievalResults.keywordHits(),
@@ -1090,6 +1102,7 @@ public class DocumentLoader {
         );
         context.steps().add(new TraceStep("resume_tool_rerank_and_token_funnel", 0L, null, hybridResult.traceData()));
         if (hybridResult.contexts().isEmpty() && retrievalResults.queryEmbedding() != null) {
+            acceptToolStatus(context, "🔁 正在放宽条件重新检索...");
             EmbeddingSearchRequest relaxedRequest = buildResumeSearchRequest(retrievalResults.queryEmbedding(), buildBaseResumeFilter(normalizedUserId), vectorMaxResults, 0.7);
             TimedValue<List<EmbeddingMatch<TextSegment>>> relaxedVectorStep = timeValue("resume_tool_vector_retrieval_relaxed", () -> searchVectorMatchesWithFallback(relaxedRequest, userIdKey, ResumeFilterConstraints.empty()));
             context.steps().add(new TraceStep(
@@ -2044,7 +2057,8 @@ public class DocumentLoader {
     }
 
     private double weightedReciprocalRank(int rankIndex, double weight) {
-        return weight / (rankIndex + 60.0d);
+        int rank = rankIndex + 1; // 0变成第1名，1变成第2名
+        return weight / (rank + 60.0d);
     }
 
     private String readParentBlockFromCache(Long parentBlockId) {
