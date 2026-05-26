@@ -36,6 +36,7 @@
         <langchain4j.easyrag.version>1.13.0-beta23</langchain4j.easyrag.version>
         <langchain4j.docparser.tika.version>1.13.0-beta23</langchain4j.docparser.tika.version>
         <langchain4j.embedding.minilmq.version>1.11.0-beta19</langchain4j.embedding.minilmq.version>
+        <spring-ai.version>1.1.6</spring-ai.version>
     </properties>
     <dependencies>
         <dependency>
@@ -71,6 +72,11 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webmvc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-mcp-server-webmvc</artifactId>
+            <version>${spring-ai.version}</version>
         </dependency>
         <dependency>
             <groupId>dev.langchain4j</groupId>

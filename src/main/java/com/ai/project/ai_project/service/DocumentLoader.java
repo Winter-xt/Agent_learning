@@ -1039,6 +1039,25 @@ public class DocumentLoader {
         return toolStep.value();
     }
 
+    String searchResumeContextsFromMcp(String userId, String query, int maxParents, boolean usePreprocessedConstraints) {
+        validateResumeQueryParams(userId, query);
+
+        String normalizedUserId = ResumeTextUtils.normalizeUserId(userId);
+        String userIdKey = ResumeTextUtils.toHexKey(normalizedUserId);
+        List<TraceStep> steps = new ArrayList<>();
+        QueryPreprocessing preprocessing = preprocessResumeQuery(query, steps);
+        ResumeToolExecutionContext context = new ResumeToolExecutionContext(normalizedUserId, userIdKey, query, preprocessing, steps, status -> {
+        });
+
+        resumeToolExecutionContext.set(context);
+        try {
+            String retrievalQuery = preprocessing.rewrittenQuery().isBlank() ? query : preprocessing.rewrittenQuery();
+            return searchResumeContextsFromTool(retrievalQuery, maxParents, usePreprocessedConstraints);
+        } finally {
+            resumeToolExecutionContext.remove();
+        }
+    }
+
     String listUploadedResumesFromTool(int limit) {
         ResumeToolExecutionContext context = currentResumeToolContext();
         int maxItems = clamp(limit, 1, 50);
