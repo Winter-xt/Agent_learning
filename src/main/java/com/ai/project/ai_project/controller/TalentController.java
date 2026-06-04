@@ -1,16 +1,14 @@
 package com.ai.project.ai_project.controller;
 
 import com.ai.project.ai_project.service.TalentService;
-import dev.langchain4j.service.TokenStream;
 import org.springframework.http.MediaType;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
-
-import java.io.IOException;
+import reactor.core.publisher.Flux;
 
 @RestController
 @RequestMapping("/api/talent")
@@ -29,31 +27,11 @@ public class TalentController {
     }
 
     @GetMapping(value = "/analyze/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter analyzeStream(@RequestParam(defaultValue = "default-user") String userId,
-                                    @RequestParam String query) {
-        SseEmitter emitter = new SseEmitter(0L);
-        TokenStream tokenStream = talentService.analyzeStream(userId, query);
-
-        tokenStream
-                .onPartialResponse(partial -> sendEvent(emitter, "token", partial))
-                .onCompleteResponse(response -> {
-                    sendEvent(emitter, "done", "[DONE]");
-                    emitter.complete();
-                })
-                .onError(error -> {
-                    sendEvent(emitter, "error", error.getMessage());
-                    emitter.completeWithError(error);
-                })
-                .start();
-
-        return emitter;
-    }
-
-    private void sendEvent(SseEmitter emitter, String eventName, String data) {
-        try {
-            emitter.send(SseEmitter.event().name(eventName).data(data == null ? "" : data));
-        } catch (IOException e) {
-            emitter.completeWithError(e);
-        }
+    public Flux<ServerSentEvent<String>> analyzeStream(@RequestParam(defaultValue = "default-user") String userId,
+                                                       @RequestParam String query) {
+        return talentService.analyzeStream(userId, query)
+                .map(token -> ServerSentEvent.builder(token).event("token").build())
+                .concatWithValues(ServerSentEvent.builder("[DONE]").event("done").build())
+                .onErrorResume(error -> Flux.just(ServerSentEvent.builder(error.getMessage()).event("error").build()));
     }
 }

@@ -1058,6 +1058,28 @@ public class DocumentLoader {
         }
     }
 
+    String searchResumeContextsFromSpringAi(String normalizedUserId,
+                                            String query,
+                                            int maxParents,
+                                            boolean usePreprocessedConstraints,
+                                            QueryPreprocessing preprocessing,
+                                            List<TraceStep> steps,
+                                            Consumer<String> statusConsumer) {
+        String userId = ResumeTextUtils.normalizeUserId(normalizedUserId);
+        String userIdKey = ResumeTextUtils.toHexKey(userId);
+        QueryPreprocessing effectivePreprocessing = preprocessing == null
+                ? new QueryPreprocessing(Intent.RESUME_QUERY, ResumeTextUtils.safe(query), ResumeFilterConstraints.empty())
+                : preprocessing;
+        ResumeToolExecutionContext context = new ResumeToolExecutionContext(userId, userIdKey, query, effectivePreprocessing, steps, statusConsumer);
+
+        resumeToolExecutionContext.set(context);
+        try {
+            return searchResumeContextsFromTool(query, maxParents, usePreprocessedConstraints);
+        } finally {
+            resumeToolExecutionContext.remove();
+        }
+    }
+
     String listUploadedResumesFromTool(int limit) {
         ResumeToolExecutionContext context = currentResumeToolContext();
         int maxItems = clamp(limit, 1, 50);

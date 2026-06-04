@@ -1,6 +1,7 @@
 package com.ai.project.ai_project.controller;
 
 import com.ai.project.ai_project.service.DocumentLoader;
+import com.ai.project.ai_project.service.SpringAiResumeService;
 import com.ai.project.ai_project.service.dto.BatchUploadResult;
 import com.ai.project.ai_project.service.dto.DeleteResumeResult;
 import com.ai.project.ai_project.service.dto.ResumeDownload;
@@ -40,13 +41,16 @@ public class DocumentController {
     private static final String DEFAULT_USER_ID = "default-user";
 
     private final DocumentLoader documentLoader;
+    private final SpringAiResumeService springAiResumeService;
     private final ObjectMapper objectMapper;
     private final Executor aiTaskExecutor;
 
     public DocumentController(DocumentLoader documentLoader,
+                              SpringAiResumeService springAiResumeService,
                               ObjectMapper objectMapper,
                               @Qualifier("aiTaskExecutor") Executor aiTaskExecutor) {
         this.documentLoader = documentLoader;
+        this.springAiResumeService = springAiResumeService;
         this.objectMapper = objectMapper;
         this.aiTaskExecutor = aiTaskExecutor;
     }
@@ -80,6 +84,35 @@ public class DocumentController {
         try {
             CompletableFuture.runAsync(
                     () -> documentLoader.queryResumeStream(
+                            userId,
+                            query,
+                            status -> sendEvent(emitter, "status", status),
+                            token -> sendEvent(emitter, "token", token),
+                            trace -> sendJsonEvent(emitter, "trace", trace),
+                            () -> {
+                                sendEvent(emitter, "done", "[DONE]");
+                                emitter.complete();
+                            },
+                            error -> {
+                                sendEvent(emitter, "error", error.getMessage());
+                                emitter.completeWithError(error);
+                            }
+                    ),
+                    aiTaskExecutor
+            );
+            return emitter;
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(BAD_REQUEST, e.getMessage(), e);
+        }
+    }
+
+    @GetMapping(value = "/query-resume-spring-ai", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter queryResumeWithSpringAi(@RequestParam(defaultValue = "default-user") String userId,
+                                              @RequestParam String query) {
+        SseEmitter emitter = new SseEmitter(0L);
+        try {
+            CompletableFuture.runAsync(
+                    () -> springAiResumeService.queryResumeStream(
                             userId,
                             query,
                             status -> sendEvent(emitter, "status", status),

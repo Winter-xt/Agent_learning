@@ -18,6 +18,7 @@ import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.memory.chat.ChatMemoryStore;
 import jakarta.annotation.PostConstruct;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
 
 import java.io.IOException;
 
@@ -86,12 +87,23 @@ public class TalentService {
      * 流式问答入口：
      * 与同步入口保持一致的路由策略，避免两条链路行为不一致。
      */
-    public TokenStream analyzeStream(String userId, String query) {
+    public Flux<String> analyzeStream(String userId, String query) {
         Intent intent = classifyIntent(query);
+        TokenStream tokenStream;
         if (IntentRoutingUtils.shouldUseRag(intent)) {
-            return streamingAnalyst.analyze(scopedMemoryId(userId), query);
+            tokenStream = streamingAnalyst.analyze(scopedMemoryId(userId), query);
+        } else {
+            tokenStream = streamingAnalystWithoutRag.analyze(scopedMemoryId(userId), query);
         }
-        return streamingAnalystWithoutRag.analyze(scopedMemoryId(userId), query);
+        return toFlux(tokenStream);
+    }
+
+    private Flux<String> toFlux(TokenStream tokenStream) {
+        return Flux.create(sink -> tokenStream
+                .onPartialResponse(sink::next)
+                .onCompleteResponse(response -> sink.complete())
+                .onError(sink::error)
+                .start());
     }
 
     /**
