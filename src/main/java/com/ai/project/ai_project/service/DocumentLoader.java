@@ -995,6 +995,14 @@ public class DocumentLoader {
     }
 
     String searchResumeContextsFromTool(String query, int maxParents, boolean usePreprocessedConstraints) {
+        try {
+            return doSearchResumeContextsFromTool(query, maxParents, usePreprocessedConstraints);
+        } catch (Exception e) {
+            return handleResumeToolFailure("resume_tool_search_failed", "简历检索工具调用失败", e);
+        }
+    }
+
+    private String doSearchResumeContextsFromTool(String query, int maxParents, boolean usePreprocessedConstraints) {
         ResumeToolExecutionContext context = currentResumeToolContext();
         String retrievalQuery = ResumeTextUtils.safe(query);
         if (retrievalQuery.isBlank()) {
@@ -1081,6 +1089,14 @@ public class DocumentLoader {
     }
 
     String listUploadedResumesFromTool(int limit) {
+        try {
+            return doListUploadedResumesFromTool(limit);
+        } catch (Exception e) {
+            return handleResumeToolFailure("resume_tool_list_resumes_failed", "简历列表工具调用失败", e);
+        }
+    }
+
+    private String doListUploadedResumesFromTool(int limit) {
         ResumeToolExecutionContext context = currentResumeToolContext();
         int maxItems = clamp(limit, 1, 50);
         acceptToolStatus(context, "📄 正在读取已上传简历列表...");
@@ -1104,6 +1120,26 @@ public class DocumentLoader {
                     + ", downloadUrl=/api/documents/resumes/" + item.resumeId() + "/download");
         }
         return String.join("\n", lines);
+    }
+
+    private String handleResumeToolFailure(String stepName, String userMessage, Exception e) {
+        String error = formatError(e);
+        log.warn("{}, error={}", userMessage, error, e);
+        ResumeToolExecutionContext context = resumeToolExecutionContext.get();
+        if (context != null) {
+            acceptToolStatus(context, "⚠️ " + userMessage + "，已降级处理");
+            context.steps().add(new TraceStep(
+                    stepName,
+                    0L,
+                    null,
+                    traceData(
+                            "fallbackUsed", true,
+                            "error", limitText(error, 300)
+                    )
+            ));
+        }
+        return userMessage + "，本次没有拿到可靠的工具结果。失败原因：" + limitText(error, 200)
+                + "。请基于已有信息回答；如果证据不足，请明确说明未检索到可靠简历上下文。";
     }
 
     private ResumeToolExecutionContext currentResumeToolContext() {
